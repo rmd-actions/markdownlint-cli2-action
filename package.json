@@ -1,6 +1,6 @@
 {
   "name": "markdownlint-cli2-action",
-  "version": "21.0.0",
+  "version": "22.0.0",
   "description": "A GitHub Action to run the markdownlint-cli2 tool for linting Markdown/CommonMark files with the markdownlint library",
   "author": {
     "name": "David Anson",
@@ -21,14 +21,14 @@
     "test": "npm run lint && npm run build && git diff --exit-code"
   },
   "dependencies": {
-    "@actions/core": "1.11.1",
-    "markdownlint-cli2": "0.19.1"
+    "@actions/core": "2.0.2",
+    "markdownlint-cli2": "0.20.0"
   },
   "devDependencies": {
-    "@eslint/js": "9.39.1",
-    "@stylistic/eslint-plugin": "5.6.1",
+    "@eslint/js": "9.39.2",
+    "@stylistic/eslint-plugin": "5.7.0",
     "@vercel/ncc": "0.38.4",
-    "eslint": "9.39.1",
+    "eslint": "9.39.2",
     "eslint-plugin-n": "17.23.1",
     "eslint-plugin-unicorn": "62.0.0"
   }
