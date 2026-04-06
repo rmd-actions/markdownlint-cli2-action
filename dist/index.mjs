@@ -45149,7 +45149,14 @@ function linkify_linkify (state, silent) {
   if (url.length <= proto.length) return false
 
   // disallow '*' at the end of the link (conflicts with emphasis)
-  url = url.replace(/\*+$/, '')
+  // do manual backsearch to avoid perf issues with regex /\*+$/ on "****...****a".
+  let urlEnd = url.length
+  while (urlEnd > 0 && url.charCodeAt(urlEnd - 1) === 0x2A/* * */) {
+    urlEnd--
+  }
+  if (urlEnd !== url.length) {
+    url = url.slice(0, urlEnd)
+  }
 
   const fullUrl = state.md.normalizeLink(url)
   if (!state.md.validateLink(fullUrl)) return false
@@ -51394,52 +51401,6 @@ const PASSTHROUGH_LISTENERS_PER_STREAM = 1;
 
 // EXTERNAL MODULE: ./node_modules/fast-glob/out/index.js
 var out = __nccwpck_require__(5648);
-;// CONCATENATED MODULE: external "node:fs/promises"
-const external_node_fs_promises_namespaceObject = __WEBPACK_EXTERNAL_createRequire(import.meta.url)("node:fs/promises");
-;// CONCATENATED MODULE: ./node_modules/path-type/index.js
-
-
-
-async function isType(fsStatType, statsMethodName, filePath) {
-	if (typeof filePath !== 'string') {
-		throw new TypeError(`Expected a string, got ${typeof filePath}`);
-	}
-
-	try {
-		const stats = await external_node_fs_promises_namespaceObject[fsStatType](filePath);
-		return stats[statsMethodName]();
-	} catch (error) {
-		if (error.code === 'ENOENT') {
-			return false;
-		}
-
-		throw error;
-	}
-}
-
-function isTypeSync(fsStatType, statsMethodName, filePath) {
-	if (typeof filePath !== 'string') {
-		throw new TypeError(`Expected a string, got ${typeof filePath}`);
-	}
-
-	try {
-		return external_node_fs_namespaceObject[fsStatType](filePath)[statsMethodName]();
-	} catch (error) {
-		if (error.code === 'ENOENT') {
-			return false;
-		}
-
-		throw error;
-	}
-}
-
-const isFile = isType.bind(undefined, 'stat', 'isFile');
-const path_type_isDirectory = isType.bind(undefined, 'stat', 'isDirectory');
-const isSymlink = isType.bind(undefined, 'lstat', 'isSymbolicLink');
-const isFileSync = isTypeSync.bind(undefined, 'statSync', 'isFile');
-const isDirectorySync = isTypeSync.bind(undefined, 'statSync', 'isDirectory');
-const isSymlinkSync = isTypeSync.bind(undefined, 'lstatSync', 'isSymbolicLink');
-
 // EXTERNAL MODULE: external "node:util"
 var external_node_util_ = __nccwpck_require__(7975);
 ;// CONCATENATED MODULE: external "node:child_process"
@@ -51495,8 +51456,24 @@ function execFileSync(file, arguments_ = [], options = {}) {
 
 
 
+;// CONCATENATED MODULE: external "node:fs/promises"
+const external_node_fs_promises_namespaceObject = __WEBPACK_EXTERNAL_createRequire(import.meta.url)("node:fs/promises");
 // EXTERNAL MODULE: ./node_modules/globby/node_modules/ignore/index.js
 var ignore = __nccwpck_require__(3417);
+;// CONCATENATED MODULE: ./node_modules/is-path-inside/index.js
+
+
+function isPathInside(childPath, parentPath) {
+	const relation = external_node_path_namespaceObject.relative(parentPath, childPath);
+
+	return Boolean(
+		relation &&
+		relation !== '..' &&
+		!relation.startsWith(`..${external_node_path_namespaceObject.sep}`) &&
+		relation !== external_node_path_namespaceObject.resolve(childPath)
+	);
+}
+
 ;// CONCATENATED MODULE: ./node_modules/slash/index.js
 function slash(path) {
 	const isExtendedLengthPath = path.startsWith('\\\\?\\');
@@ -51509,9 +51486,308 @@ function slash(path) {
 }
 
 ;// CONCATENATED MODULE: ./node_modules/globby/utilities.js
+
+
+
+
+
 const isNegativePattern = pattern => pattern[0] === '!';
 
+/**
+Normalize an absolute pattern to be relative.
+
+On Unix, patterns starting with `/` are interpreted as absolute paths from the filesystem root. This causes inconsistent behavior across platforms since Windows uses different path roots (like `C:\`).
+
+This function strips leading `/` to make patterns relative to cwd, ensuring consistent cross-platform behavior.
+
+@param {string} pattern - The pattern to normalize.
+*/
+const normalizeAbsolutePatternToRelative = pattern => pattern.startsWith('/') ? pattern.slice(1) : pattern;
+
+const bindFsMethod = (object, methodName) => {
+	const method = object?.[methodName];
+	return typeof method === 'function' ? method.bind(object) : undefined;
+};
+
+// Only used as a fallback for legacy fs implementations
+const promisifyFsMethod = (object, methodName) => {
+	const method = object?.[methodName];
+	if (typeof method !== 'function') {
+		return undefined;
+	}
+
+	return (0,external_node_util_.promisify)(method.bind(object));
+};
+
+const normalizeDirectoryPatternForFastGlob = pattern => {
+	if (!pattern.endsWith('/')) {
+		return pattern;
+	}
+
+	const trimmedPattern = pattern.replace(/\/+$/u, '');
+	if (!trimmedPattern) {
+		return '/**';
+	}
+
+	// Special case for '**/' to avoid producing '**/**/**'
+	if (trimmedPattern === '**') {
+		return '**/**';
+	}
+
+	const hasLeadingSlash = trimmedPattern.startsWith('/');
+	const patternBody = hasLeadingSlash ? trimmedPattern.slice(1) : trimmedPattern;
+	const hasInnerSlash = patternBody.includes('/');
+	const needsRecursivePrefix = !hasLeadingSlash && !hasInnerSlash && !trimmedPattern.startsWith('**/');
+	const recursivePrefix = needsRecursivePrefix ? '**/' : '';
+
+	return `${recursivePrefix}${trimmedPattern}/**`;
+};
+
+/**
+Extract the parent directory prefix from a pattern (e.g., '../' or '../../').
+
+Note: Patterns should have trailing slash after '..' (e.g., '../foo' not '..foo'). The directoryToGlob function ensures this in the normal pipeline.
+
+@param {string} pattern - The pattern to analyze.
+@returns {string} The parent directory prefix, or empty string if none.
+*/
+const getParentDirectoryPrefix = pattern => {
+	const normalizedPattern = isNegativePattern(pattern) ? pattern.slice(1) : pattern;
+	const match = normalizedPattern.match(/^(\.\.\/)+/);
+	return match ? match[0] : '';
+};
+
+/**
+Adjust ignore patterns to match the relative base of the main patterns.
+
+When patterns reference parent directories, ignore patterns starting with globstars need to be adjusted to match from the same base directory. This ensures intuitive behavior where ignore patterns work correctly with parent directory patterns.
+
+This is analogous to how node-glob normalizes path prefixes (see node-glob issue #309) and how Rust ignore crate strips path prefixes before matching.
+
+@param {string[]} patterns - The main glob patterns.
+@param {string[]} ignorePatterns - The ignore patterns to adjust.
+@returns {string[]} Adjusted ignore patterns.
+*/
+const adjustIgnorePatternsForParentDirectories = (patterns, ignorePatterns) => {
+	// Early exit for empty arrays
+	if (patterns.length === 0 || ignorePatterns.length === 0) {
+		return ignorePatterns;
+	}
+
+	// Get parent directory prefixes for all patterns (empty string if no prefix)
+	const parentPrefixes = patterns.map(pattern => getParentDirectoryPrefix(pattern));
+
+	// Check if all patterns have the same parent prefix
+	const firstPrefix = parentPrefixes[0];
+	if (!firstPrefix) {
+		return ignorePatterns; // No parent directories in any pattern
+	}
+
+	const allSamePrefix = parentPrefixes.every(prefix => prefix === firstPrefix);
+	if (!allSamePrefix) {
+		return ignorePatterns; // Mixed bases - don't adjust
+	}
+
+	// Adjust ignore patterns that start with **/
+	return ignorePatterns.map(pattern => {
+		// Only adjust patterns starting with **/ that don't already have a parent reference
+		if (pattern.startsWith('**/') && !pattern.startsWith('../')) {
+			return firstPrefix + pattern;
+		}
+
+		return pattern;
+	});
+};
+
+/**
+Find the git root directory by searching upward for a .git directory.
+
+@param {string} cwd - The directory to start searching from.
+@param {Object} [fsImplementation] - Optional fs implementation.
+@returns {string|undefined} The git root directory path, or undefined if not found.
+*/
+const getAsyncStatMethod = fsImplementation =>
+	bindFsMethod(fsImplementation?.promises, 'stat')
+	?? bindFsMethod(external_node_fs_namespaceObject.promises, 'stat');
+
+const getStatSyncMethod = fsImplementation => {
+	if (fsImplementation) {
+		return bindFsMethod(fsImplementation, 'statSync');
+	}
+
+	return bindFsMethod(external_node_fs_namespaceObject, 'statSync');
+};
+
+const pathHasGitDirectory = stats => Boolean(stats?.isDirectory?.() || stats?.isFile?.());
+
+const buildPathChain = (startPath, rootPath) => {
+	const chain = [];
+	let currentPath = startPath;
+
+	chain.push(currentPath);
+
+	while (currentPath !== rootPath) {
+		const parentPath = external_node_path_namespaceObject.dirname(currentPath);
+		if (parentPath === currentPath) {
+			break;
+		}
+
+		currentPath = parentPath;
+		chain.push(currentPath);
+	}
+
+	return chain;
+};
+
+const findGitRootInChain = async (paths, statMethod) => {
+	for (const directory of paths) {
+		const gitPath = external_node_path_namespaceObject.join(directory, '.git');
+
+		try {
+			const stats = await statMethod(gitPath); // eslint-disable-line no-await-in-loop
+			if (pathHasGitDirectory(stats)) {
+				return directory;
+			}
+		} catch {
+			// Ignore errors and continue searching
+		}
+	}
+
+	return undefined;
+};
+
+const findGitRootSyncUncached = (cwd, fsImplementation) => {
+	const statSyncMethod = getStatSyncMethod(fsImplementation);
+	if (!statSyncMethod) {
+		return undefined;
+	}
+
+	const currentPath = external_node_path_namespaceObject.resolve(cwd);
+	const {root} = external_node_path_namespaceObject.parse(currentPath);
+	const chain = buildPathChain(currentPath, root);
+
+	for (const directory of chain) {
+		const gitPath = external_node_path_namespaceObject.join(directory, '.git');
+		try {
+			const stats = statSyncMethod(gitPath);
+			if (pathHasGitDirectory(stats)) {
+				return directory;
+			}
+		} catch {
+			// Ignore errors and continue searching
+		}
+	}
+
+	return undefined;
+};
+
+const findGitRootSync = (cwd, fsImplementation) => {
+	if (typeof cwd !== 'string') {
+		throw new TypeError('cwd must be a string');
+	}
+
+	return findGitRootSyncUncached(cwd, fsImplementation);
+};
+
+const findGitRootAsyncUncached = async (cwd, fsImplementation) => {
+	const statMethod = getAsyncStatMethod(fsImplementation);
+	if (!statMethod) {
+		return findGitRootSync(cwd, fsImplementation);
+	}
+
+	const currentPath = external_node_path_namespaceObject.resolve(cwd);
+	const {root} = external_node_path_namespaceObject.parse(currentPath);
+	const chain = buildPathChain(currentPath, root);
+
+	return findGitRootInChain(chain, statMethod);
+};
+
+const findGitRoot = async (cwd, fsImplementation) => {
+	if (typeof cwd !== 'string') {
+		throw new TypeError('cwd must be a string');
+	}
+
+	return findGitRootAsyncUncached(cwd, fsImplementation);
+};
+
+/**
+Get paths to all .gitignore files from git root to cwd (inclusive).
+
+@param {string} gitRoot - The git root directory.
+@param {string} cwd - The current working directory.
+@returns {string[]} Array of .gitignore file paths to search for.
+*/
+const isWithinGitRoot = (gitRoot, cwd) => {
+	const resolvedGitRoot = external_node_path_namespaceObject.resolve(gitRoot);
+	const resolvedCwd = external_node_path_namespaceObject.resolve(cwd);
+	return resolvedCwd === resolvedGitRoot || isPathInside(resolvedCwd, resolvedGitRoot);
+};
+
+const getParentGitignorePaths = (gitRoot, cwd) => {
+	if (gitRoot && typeof gitRoot !== 'string') {
+		throw new TypeError('gitRoot must be a string or undefined');
+	}
+
+	if (typeof cwd !== 'string') {
+		throw new TypeError('cwd must be a string');
+	}
+
+	// If no gitRoot provided, return empty array
+	if (!gitRoot) {
+		return [];
+	}
+
+	if (!isWithinGitRoot(gitRoot, cwd)) {
+		return [];
+	}
+
+	const chain = buildPathChain(external_node_path_namespaceObject.resolve(cwd), external_node_path_namespaceObject.resolve(gitRoot));
+
+	return [...chain]
+		.reverse()
+		.map(directory => external_node_path_namespaceObject.join(directory, '.gitignore'));
+};
+
+/**
+Convert ignore patterns to fast-glob compatible format.
+Returns empty array if patterns should be handled by predicate only.
+
+@param {string[]} patterns - Ignore patterns from .gitignore files
+@param {boolean} usingGitRoot - Whether patterns are relative to git root
+@param {Function} normalizeDirectoryPatternForFastGlob - Function to normalize directory patterns
+@returns {string[]} Patterns safe to pass to fast-glob, or empty array
+*/
+const convertPatternsForFastGlob = (patterns, usingGitRoot, normalizeDirectoryPatternForFastGlob) => {
+	// Determine which patterns are safe to pass to fast-glob
+	// If there are negation patterns, we can't pass file patterns to fast-glob
+	// because fast-glob doesn't understand negations and would filter out files
+	// that should be re-included by negation patterns.
+	// If we're using git root, patterns are relative to git root not cwd,
+	// so we can't pass them to fast-glob which expects cwd-relative patterns.
+	// We only pass patterns to fast-glob if there are NO negations AND we're not using git root.
+
+	if (usingGitRoot) {
+		return []; // Patterns are relative to git root, not cwd
+	}
+
+	const result = [];
+	let hasNegations = false;
+
+	// Single pass to check for negations and collect positive patterns
+	for (const pattern of patterns) {
+		if (isNegativePattern(pattern)) {
+			hasNegations = true;
+			break; // Early exit on first negation
+		}
+
+		result.push(normalizeDirectoryPatternForFastGlob(pattern));
+	}
+
+	return hasNegations ? [] : result;
+};
+
 ;// CONCATENATED MODULE: ./node_modules/globby/ignore.js
+
 
 
 
@@ -51534,6 +51810,107 @@ const ignoreFilesGlobOptions = {
 };
 
 const GITIGNORE_FILES_PATTERN = '**/.gitignore';
+
+const getReadFileMethod = fsImplementation =>
+	bindFsMethod(fsImplementation?.promises, 'readFile')
+	?? bindFsMethod(external_node_fs_promises_namespaceObject, 'readFile')
+	?? promisifyFsMethod(fsImplementation, 'readFile');
+
+const getReadFileSyncMethod = fsImplementation =>
+	bindFsMethod(fsImplementation, 'readFileSync')
+	?? bindFsMethod(external_node_fs_namespaceObject, 'readFileSync');
+
+const shouldSkipIgnoreFileError = (error, suppressErrors) => {
+	if (!error) {
+		return Boolean(suppressErrors);
+	}
+
+	if (error.code === 'ENOENT' || error.code === 'ENOTDIR') {
+		return true;
+	}
+
+	return Boolean(suppressErrors);
+};
+
+const createIgnoreFileReadError = (filePath, error) => {
+	if (error instanceof Error) {
+		error.message = `Failed to read ignore file at ${filePath}: ${error.message}`;
+		return error;
+	}
+
+	return new Error(`Failed to read ignore file at ${filePath}: ${String(error)}`);
+};
+
+const processIgnoreFileCore = (filePath, readMethod, suppressErrors) => {
+	try {
+		const content = readMethod(filePath, 'utf8');
+		return {filePath, content};
+	} catch (error) {
+		if (shouldSkipIgnoreFileError(error, suppressErrors)) {
+			return undefined;
+		}
+
+		throw createIgnoreFileReadError(filePath, error);
+	}
+};
+
+const readIgnoreFilesSafely = async (paths, readFileMethod, suppressErrors) => {
+	const fileResults = await Promise.all(paths.map(async filePath => {
+		try {
+			const content = await readFileMethod(filePath, 'utf8');
+			return {filePath, content};
+		} catch (error) {
+			if (shouldSkipIgnoreFileError(error, suppressErrors)) {
+				return undefined;
+			}
+
+			throw createIgnoreFileReadError(filePath, error);
+		}
+	}));
+
+	return fileResults.filter(Boolean);
+};
+
+const readIgnoreFilesSafelySync = (paths, readFileSyncMethod, suppressErrors) => paths
+	.map(filePath => processIgnoreFileCore(filePath, readFileSyncMethod, suppressErrors))
+	.filter(Boolean);
+
+const dedupePaths = paths => {
+	const seen = new Set();
+	return paths.filter(filePath => {
+		if (seen.has(filePath)) {
+			return false;
+		}
+
+		seen.add(filePath);
+		return true;
+	});
+};
+
+const globIgnoreFiles = (globFunction, patterns, normalizedOptions) => globFunction(patterns, {
+	...normalizedOptions,
+	...ignoreFilesGlobOptions, // Must be last to ensure absolute/dot flags stick
+});
+
+const getParentIgnorePaths = (gitRoot, normalizedOptions) => gitRoot
+	? getParentGitignorePaths(gitRoot, normalizedOptions.cwd)
+	: [];
+
+const combineIgnoreFilePaths = (gitRoot, normalizedOptions, childPaths) => dedupePaths([
+	...getParentIgnorePaths(gitRoot, normalizedOptions),
+	...childPaths,
+]);
+
+const buildIgnoreResult = (files, normalizedOptions, gitRoot) => {
+	const baseDir = gitRoot || normalizedOptions.cwd;
+	const patterns = getPatternsFromIgnoreFiles(files, baseDir);
+
+	return {
+		patterns,
+		predicate: createIgnorePredicate(patterns, normalizedOptions.cwd, baseDir),
+		usingGitRoot: Boolean(gitRoot && gitRoot !== normalizedOptions.cwd),
+	};
+};
 
 // Apply base path to gitignore patterns based on .gitignore spec 2.22.1
 // https://git-scm.com/docs/gitignore#_pattern_format
@@ -51581,13 +51958,17 @@ const parseIgnoreFile = (file, cwd) => {
 };
 
 const toRelativePath = (fileOrDirectory, cwd) => {
-	cwd = slash(cwd);
 	if (external_node_path_namespaceObject.isAbsolute(fileOrDirectory)) {
-		if (slash(fileOrDirectory).startsWith(cwd)) {
-			return external_node_path_namespaceObject.relative(cwd, fileOrDirectory);
+		// When paths are equal, path.relative returns empty string which is valid
+		// isPathInside returns false for equal paths, so check this case first
+		const relativePath = external_node_path_namespaceObject.relative(cwd, fileOrDirectory);
+		if (relativePath && !isPathInside(fileOrDirectory, cwd)) {
+			// Path is outside cwd - it cannot be ignored by patterns in cwd
+			// Return undefined to indicate this path is outside scope
+			return undefined;
 		}
 
-		throw new Error(`Path ${fileOrDirectory} is not in cwd ${cwd}`);
+		return relativePath;
 	}
 
 	// Normalize relative paths:
@@ -51607,65 +51988,131 @@ const toRelativePath = (fileOrDirectory, cwd) => {
 	return fileOrDirectory;
 };
 
-const getIsIgnoredPredicate = (files, cwd) => {
-	const patterns = files.flatMap(file => parseIgnoreFile(file, cwd));
+const createIgnorePredicate = (patterns, cwd, baseDir) => {
 	const ignores = ignore().add(patterns);
+	// Normalize to handle path separator and . / .. components consistently
+	const resolvedCwd = external_node_path_namespaceObject.normalize(external_node_path_namespaceObject.resolve(cwd));
+	const resolvedBaseDir = external_node_path_namespaceObject.normalize(external_node_path_namespaceObject.resolve(baseDir));
 
 	return fileOrDirectory => {
 		fileOrDirectory = toPath(fileOrDirectory);
-		fileOrDirectory = toRelativePath(fileOrDirectory, cwd);
-		// If path is outside cwd (undefined), it can't be ignored by patterns in cwd
-		if (fileOrDirectory === undefined) {
+
+		// Never ignore the cwd itself - use normalized comparison
+		const normalizedPath = external_node_path_namespaceObject.normalize(external_node_path_namespaceObject.resolve(fileOrDirectory));
+		if (normalizedPath === resolvedCwd) {
 			return false;
 		}
 
-		return fileOrDirectory ? ignores.ignores(slash(fileOrDirectory)) : false;
+		// Convert to relative path from baseDir (use normalized baseDir)
+		const relativePath = toRelativePath(fileOrDirectory, resolvedBaseDir);
+
+		// If path is outside baseDir (undefined), it can't be ignored by patterns
+		if (relativePath === undefined) {
+			return false;
+		}
+
+		return relativePath ? ignores.ignores(slash(relativePath)) : false;
 	};
 };
 
-const normalizeOptions = (options = {}) => ({
-	cwd: toPath(options.cwd) ?? external_node_process_namespaceObject.cwd(),
-	suppressErrors: Boolean(options.suppressErrors),
-	deep: typeof options.deep === 'number' ? options.deep : Number.POSITIVE_INFINITY,
-	ignore: [...options.ignore ?? [], ...defaultIgnoredDirectories],
-});
+const normalizeOptions = (options = {}) => {
+	const ignoreOption = options.ignore
+		? (Array.isArray(options.ignore) ? options.ignore : [options.ignore])
+		: [];
+
+	const cwd = toPath(options.cwd) ?? external_node_process_namespaceObject.cwd();
+
+	// Adjust deep option for fast-glob: fast-glob's deep counts differently than expected
+	// User's deep: 0 = root only -> fast-glob needs: 1
+	// User's deep: 1 = root + 1 level -> fast-glob needs: 2
+	const deep = typeof options.deep === 'number' ? Math.max(0, options.deep) + 1 : Number.POSITIVE_INFINITY;
+
+	// Only pass through specific fast-glob options that make sense for finding ignore files
+	return {
+		cwd,
+		suppressErrors: options.suppressErrors ?? false,
+		deep,
+		ignore: [...ignoreOption, ...defaultIgnoredDirectories],
+		followSymbolicLinks: options.followSymbolicLinks ?? true,
+		concurrency: options.concurrency,
+		throwErrorOnBrokenSymbolicLink: options.throwErrorOnBrokenSymbolicLink ?? false,
+		fs: options.fs,
+	};
+};
+
+const collectIgnoreFileArtifactsAsync = async (patterns, options, includeParentIgnoreFiles) => {
+	const normalizedOptions = normalizeOptions(options);
+	const childPaths = await globIgnoreFiles(out, patterns, normalizedOptions);
+	const gitRoot = includeParentIgnoreFiles
+		? await findGitRoot(normalizedOptions.cwd, normalizedOptions.fs)
+		: undefined;
+	const allPaths = combineIgnoreFilePaths(gitRoot, normalizedOptions, childPaths);
+	const readFileMethod = getReadFileMethod(normalizedOptions.fs);
+	const files = await readIgnoreFilesSafely(allPaths, readFileMethod, normalizedOptions.suppressErrors);
+
+	return {files, normalizedOptions, gitRoot};
+};
+
+const collectIgnoreFileArtifactsSync = (patterns, options, includeParentIgnoreFiles) => {
+	const normalizedOptions = normalizeOptions(options);
+	const childPaths = globIgnoreFiles(out.sync, patterns, normalizedOptions);
+	const gitRoot = includeParentIgnoreFiles
+		? findGitRootSync(normalizedOptions.cwd, normalizedOptions.fs)
+		: undefined;
+	const allPaths = combineIgnoreFilePaths(gitRoot, normalizedOptions, childPaths);
+	const readFileSyncMethod = getReadFileSyncMethod(normalizedOptions.fs);
+	const files = readIgnoreFilesSafelySync(allPaths, readFileSyncMethod, normalizedOptions.suppressErrors);
+
+	return {files, normalizedOptions, gitRoot};
+};
 
 const isIgnoredByIgnoreFiles = async (patterns, options) => {
-	const {cwd, suppressErrors, deep, ignore} = normalizeOptions(options);
-
-	const paths = await out(patterns, {
-		cwd,
-		suppressErrors,
-		deep,
-		ignore,
-		...ignoreFilesGlobOptions,
-	});
-
-	const files = await Promise.all(paths.map(async filePath => ({
-		filePath,
-		content: await external_node_fs_promises_namespaceObject.readFile(filePath, 'utf8'),
-	})));
-
-	return getIsIgnoredPredicate(files, cwd);
+	const {files, normalizedOptions, gitRoot} = await collectIgnoreFileArtifactsAsync(patterns, options, false);
+	return buildIgnoreResult(files, normalizedOptions, gitRoot).predicate;
 };
 
 const isIgnoredByIgnoreFilesSync = (patterns, options) => {
-	const {cwd, suppressErrors, deep, ignore} = normalizeOptions(options);
+	const {files, normalizedOptions, gitRoot} = collectIgnoreFileArtifactsSync(patterns, options, false);
+	return buildIgnoreResult(files, normalizedOptions, gitRoot).predicate;
+};
 
-	const paths = out.sync(patterns, {
-		cwd,
-		suppressErrors,
-		deep,
-		ignore,
-		...ignoreFilesGlobOptions,
-	});
+const getPatternsFromIgnoreFiles = (files, baseDir) => files.flatMap(file => parseIgnoreFile(file, baseDir));
 
-	const files = paths.map(filePath => ({
-		filePath,
-		content: external_node_fs_namespaceObject.readFileSync(filePath, 'utf8'),
-	}));
+/**
+Read ignore files and return both patterns and predicate.
+This avoids reading the same files twice (once for patterns, once for filtering).
 
-	return getIsIgnoredPredicate(files, cwd);
+@param {string[]} patterns - Patterns to find ignore files
+@param {Object} options - Options object
+@param {boolean} [includeParentIgnoreFiles=false] - Whether to search for parent .gitignore files
+@returns {Promise<{patterns: string[], predicate: Function, usingGitRoot: boolean}>}
+*/
+const getIgnorePatternsAndPredicate = async (patterns, options, includeParentIgnoreFiles = false) => {
+	const {files, normalizedOptions, gitRoot} = await collectIgnoreFileArtifactsAsync(
+		patterns,
+		options,
+		includeParentIgnoreFiles,
+	);
+
+	return buildIgnoreResult(files, normalizedOptions, gitRoot);
+};
+
+/**
+Read ignore files and return both patterns and predicate (sync version).
+
+@param {string[]} patterns - Patterns to find ignore files
+@param {Object} options - Options object
+@param {boolean} [includeParentIgnoreFiles=false] - Whether to search for parent .gitignore files
+@returns {{patterns: string[], predicate: Function, usingGitRoot: boolean}}
+*/
+const getIgnorePatternsAndPredicateSync = (patterns, options, includeParentIgnoreFiles = false) => {
+	const {files, normalizedOptions, gitRoot} = collectIgnoreFileArtifactsSync(
+		patterns,
+		options,
+		includeParentIgnoreFiles,
+	);
+
+	return buildIgnoreResult(files, normalizedOptions, gitRoot);
 };
 
 const isGitIgnored = options => isIgnoredByIgnoreFiles(GITIGNORE_FILES_PATTERN, options);
@@ -51682,10 +52129,36 @@ const isGitIgnoredSync = options => isIgnoredByIgnoreFilesSync(GITIGNORE_FILES_P
 
 
 
-
 const assertPatternsInput = patterns => {
 	if (patterns.some(pattern => typeof pattern !== 'string')) {
 		throw new TypeError('Patterns must be a string or an array of strings');
+	}
+};
+
+const getStatMethod = fsImplementation =>
+	bindFsMethod(fsImplementation?.promises, 'stat')
+	?? bindFsMethod(external_node_fs_namespaceObject.promises, 'stat')
+	?? promisifyFsMethod(fsImplementation, 'stat');
+
+const globby_getStatSyncMethod = fsImplementation =>
+	bindFsMethod(fsImplementation, 'statSync')
+	?? bindFsMethod(external_node_fs_namespaceObject, 'statSync');
+
+const globby_isDirectory = async (path, fsImplementation) => {
+	try {
+		const stats = await getStatMethod(fsImplementation)(path);
+		return stats.isDirectory();
+	} catch {
+		return false;
+	}
+};
+
+const isDirectorySync = (path, fsImplementation) => {
+	try {
+		const stats = globby_getStatSyncMethod(fsImplementation)(path);
+		return stats.isDirectory();
+	} catch {
+		return false;
 	}
 };
 
@@ -51718,6 +52191,7 @@ const directoryToGlob = async (directoryPaths, {
 	cwd = external_node_process_namespaceObject.cwd(),
 	files,
 	extensions,
+	fs: fsImplementation,
 } = {}) => {
 	const globs = await Promise.all(directoryPaths.map(async directoryPath => {
 		// Check pattern without negative prefix
@@ -51730,7 +52204,7 @@ const directoryToGlob = async (directoryPaths, {
 
 		// Original logic for checking actual directories
 		const pathToCheck = normalizePathForDirectoryGlob(directoryPath, cwd);
-		return (await path_type_isDirectory(pathToCheck)) ? getDirectoryGlob({directoryPath, files, extensions}) : directoryPath;
+		return (await globby_isDirectory(pathToCheck, fsImplementation)) ? getDirectoryGlob({directoryPath, files, extensions}) : directoryPath;
 	}));
 
 	return globs.flat();
@@ -51740,6 +52214,7 @@ const directoryToGlobSync = (directoryPaths, {
 	cwd = external_node_process_namespaceObject.cwd(),
 	files,
 	extensions,
+	fs: fsImplementation,
 } = {}) => directoryPaths.flatMap(directoryPath => {
 	// Check pattern without negative prefix
 	const checkPattern = isNegativePattern(directoryPath) ? directoryPath.slice(1) : directoryPath;
@@ -51751,7 +52226,7 @@ const directoryToGlobSync = (directoryPaths, {
 
 	// Original logic for checking actual directories
 	const pathToCheck = normalizePathForDirectoryGlob(directoryPath, cwd);
-	return isDirectorySync(pathToCheck) ? getDirectoryGlob({directoryPath, files, extensions}) : directoryPath;
+	return isDirectorySync(pathToCheck, fsImplementation) ? getDirectoryGlob({directoryPath, files, extensions}) : directoryPath;
 });
 
 const toPatternsArray = patterns => {
@@ -51760,32 +52235,38 @@ const toPatternsArray = patterns => {
 	return patterns;
 };
 
-const checkCwdOption = cwd => {
-	if (!cwd) {
+const checkCwdOption = (cwd, fsImplementation = external_node_fs_namespaceObject) => {
+	if (!cwd || !fsImplementation.statSync) {
 		return;
 	}
 
-	let stat;
+	let stats;
 	try {
-		stat = external_node_fs_namespaceObject.statSync(cwd);
+		stats = fsImplementation.statSync(cwd);
 	} catch {
+		// If stat fails (e.g., path doesn't exist), let fast-glob handle it
 		return;
 	}
 
-	if (!stat.isDirectory()) {
-		throw new Error('The `cwd` option must be a path to a directory');
+	if (!stats.isDirectory()) {
+		throw new Error(`The \`cwd\` option must be a path to a directory, got: ${cwd}`);
 	}
 };
 
 const globby_normalizeOptions = (options = {}) => {
+	// Normalize ignore to an array (fast-glob accepts string but we need array internally)
+	const ignore = options.ignore
+		? (Array.isArray(options.ignore) ? options.ignore : [options.ignore])
+		: [];
+
 	options = {
 		...options,
-		ignore: options.ignore ?? [],
+		ignore,
 		expandDirectories: options.expandDirectories ?? true,
 		cwd: toPath(options.cwd),
 	};
 
-	checkCwdOption(options.cwd);
+	checkCwdOption(options.cwd, options.fs);
 
 	return options;
 };
@@ -51804,28 +52285,113 @@ const getIgnoreFilesPatterns = options => {
 	return patterns;
 };
 
-const getFilter = async options => {
+/**
+Apply gitignore patterns to options and return filter predicate.
+
+When negation patterns are present (e.g., '!important.log'), we cannot pass positive patterns to fast-glob because it would filter out files before our predicate can re-include them. In this case, we rely entirely on the predicate for filtering, which handles negations correctly.
+
+When there are no negations, we optimize by passing patterns to fast-glob's ignore option to skip directories during traversal (performance optimization).
+
+All patterns (including negated) are always used in the filter predicate to ensure correct Git-compatible behavior.
+
+@returns {Promise<{options: Object, filter: Function}>}
+*/
+const applyIgnoreFilesAndGetFilter = async options => {
 	const ignoreFilesPatterns = getIgnoreFilesPatterns(options);
-	return createFilterFunction(ignoreFilesPatterns.length > 0 && await isIgnoredByIgnoreFiles(ignoreFilesPatterns, options));
+
+	if (ignoreFilesPatterns.length === 0) {
+		return {
+			options,
+			filter: createFilterFunction(false, options.cwd),
+		};
+	}
+
+	// Read ignore files once and get both patterns and predicate
+	// Enable parent .gitignore search when using gitignore option
+	const includeParentIgnoreFiles = options.gitignore === true;
+	const {patterns, predicate, usingGitRoot} = await getIgnorePatternsAndPredicate(ignoreFilesPatterns, options, includeParentIgnoreFiles);
+
+	// Convert patterns to fast-glob format (may return empty array if predicate should handle everything)
+	const patternsForFastGlob = convertPatternsForFastGlob(patterns, usingGitRoot, normalizeDirectoryPatternForFastGlob);
+
+	const modifiedOptions = {
+		...options,
+		ignore: [...options.ignore, ...patternsForFastGlob],
+	};
+
+	return {
+		options: modifiedOptions,
+		filter: createFilterFunction(predicate, options.cwd),
+	};
 };
 
-const getFilterSync = options => {
+/**
+Apply gitignore patterns to options and return filter predicate (sync version).
+
+@returns {{options: Object, filter: Function}}
+*/
+const applyIgnoreFilesAndGetFilterSync = options => {
 	const ignoreFilesPatterns = getIgnoreFilesPatterns(options);
-	return createFilterFunction(ignoreFilesPatterns.length > 0 && isIgnoredByIgnoreFilesSync(ignoreFilesPatterns, options));
+
+	if (ignoreFilesPatterns.length === 0) {
+		return {
+			options,
+			filter: createFilterFunction(false, options.cwd),
+		};
+	}
+
+	// Read ignore files once and get both patterns and predicate
+	// Enable parent .gitignore search when using gitignore option
+	const includeParentIgnoreFiles = options.gitignore === true;
+	const {patterns, predicate, usingGitRoot} = getIgnorePatternsAndPredicateSync(ignoreFilesPatterns, options, includeParentIgnoreFiles);
+
+	// Convert patterns to fast-glob format (may return empty array if predicate should handle everything)
+	const patternsForFastGlob = convertPatternsForFastGlob(patterns, usingGitRoot, normalizeDirectoryPatternForFastGlob);
+
+	const modifiedOptions = {
+		...options,
+		ignore: [...options.ignore, ...patternsForFastGlob],
+	};
+
+	return {
+		options: modifiedOptions,
+		filter: createFilterFunction(predicate, options.cwd),
+	};
 };
 
-const createFilterFunction = isIgnored => {
+const createFilterFunction = (isIgnored, cwd) => {
 	const seen = new Set();
+	const basePath = cwd || external_node_process_namespaceObject.cwd();
+	const pathCache = new Map(); // Cache for resolved paths
 
 	return fastGlobResult => {
 		const pathKey = external_node_path_namespaceObject.normalize(fastGlobResult.path ?? fastGlobResult);
 
-		if (seen.has(pathKey) || (isIgnored && isIgnored(pathKey))) {
+		// Check seen set first (fast path)
+		if (seen.has(pathKey)) {
 			return false;
 		}
 
-		seen.add(pathKey);
+		// Only compute absolute path and check predicate if needed
+		if (isIgnored) {
+			let absolutePath = pathCache.get(pathKey);
+			if (absolutePath === undefined) {
+				absolutePath = external_node_path_namespaceObject.isAbsolute(pathKey) ? pathKey : external_node_path_namespaceObject.resolve(basePath, pathKey);
+				pathCache.set(pathKey, absolutePath);
 
+				// Only clear path cache if it gets too large
+				// Never clear 'seen' as it's needed for deduplication
+				if (pathCache.size > 10_000) {
+					pathCache.clear();
+				}
+			}
+
+			if (isIgnored(absolutePath)) {
+				return false;
+			}
+		}
+
+		seen.add(pathKey);
 		return true;
 	};
 };
@@ -51833,6 +52399,21 @@ const createFilterFunction = isIgnored => {
 const unionFastGlobResults = (results, filter) => results.flat().filter(fastGlobResult => filter(fastGlobResult));
 
 const convertNegativePatterns = (patterns, options) => {
+	// If all patterns are negative and expandNegationOnlyPatterns is enabled (default),
+	// prepend a positive catch-all pattern to make negation-only patterns work intuitively
+	// (e.g., '!*.json' matches all files except JSON)
+	if (patterns.length > 0 && patterns.every(pattern => isNegativePattern(pattern))) {
+		if (options.expandNegationOnlyPatterns === false) {
+			return [];
+		}
+
+		patterns = ['**/*', ...patterns];
+	}
+
+	patterns = patterns.map(pattern => isNegativePattern(pattern)
+		? `!${normalizeAbsolutePatternToRelative(pattern.slice(1))}`
+		: pattern);
+
 	const tasks = [];
 
 	while (patterns.length > 0) {
@@ -51868,6 +52449,14 @@ const convertNegativePatterns = (patterns, options) => {
 	return tasks;
 };
 
+const applyParentDirectoryIgnoreAdjustments = tasks => tasks.map(task => ({
+	patterns: task.patterns,
+	options: {
+		...task.options,
+		ignore: adjustIgnorePatternsForParentDirectories(task.patterns, task.options.ignore),
+	},
+}));
+
 const normalizeExpandDirectoriesOption = (options, cwd) => ({
 	...(cwd ? {cwd} : {}),
 	...(Array.isArray(options) ? {files: options} : options),
@@ -51876,13 +52465,16 @@ const normalizeExpandDirectoriesOption = (options, cwd) => ({
 const generateTasks = async (patterns, options) => {
 	const globTasks = convertNegativePatterns(patterns, options);
 
-	const {cwd, expandDirectories} = options;
+	const {cwd, expandDirectories, fs: fsImplementation} = options;
 
 	if (!expandDirectories) {
-		return globTasks;
+		return applyParentDirectoryIgnoreAdjustments(globTasks);
 	}
 
-	const directoryToGlobOptions = normalizeExpandDirectoriesOption(expandDirectories, cwd);
+	const directoryToGlobOptions = {
+		...normalizeExpandDirectoriesOption(expandDirectories, cwd),
+		fs: fsImplementation,
+	};
 
 	return Promise.all(globTasks.map(async task => {
 		let {patterns, options} = task;
@@ -51892,8 +52484,11 @@ const generateTasks = async (patterns, options) => {
 			options.ignore,
 		] = await Promise.all([
 			directoryToGlob(patterns, directoryToGlobOptions),
-			directoryToGlob(options.ignore, {cwd}),
+			directoryToGlob(options.ignore, {cwd, fs: fsImplementation}),
 		]);
+
+		// Adjust ignore patterns for parent directory references
+		options.ignore = adjustIgnorePatternsForParentDirectories(patterns, options.ignore);
 
 		return {patterns, options};
 	}));
@@ -51901,45 +52496,58 @@ const generateTasks = async (patterns, options) => {
 
 const generateTasksSync = (patterns, options) => {
 	const globTasks = convertNegativePatterns(patterns, options);
-	const {cwd, expandDirectories} = options;
+	const {cwd, expandDirectories, fs: fsImplementation} = options;
 
 	if (!expandDirectories) {
-		return globTasks;
+		return applyParentDirectoryIgnoreAdjustments(globTasks);
 	}
 
-	const directoryToGlobSyncOptions = normalizeExpandDirectoriesOption(expandDirectories, cwd);
+	const directoryToGlobSyncOptions = {
+		...normalizeExpandDirectoriesOption(expandDirectories, cwd),
+		fs: fsImplementation,
+	};
 
 	return globTasks.map(task => {
 		let {patterns, options} = task;
 		patterns = directoryToGlobSync(patterns, directoryToGlobSyncOptions);
-		options.ignore = directoryToGlobSync(options.ignore, {cwd});
+		options.ignore = directoryToGlobSync(options.ignore, {cwd, fs: fsImplementation});
+
+		// Adjust ignore patterns for parent directory references
+		options.ignore = adjustIgnorePatternsForParentDirectories(patterns, options.ignore);
+
 		return {patterns, options};
 	});
 };
 
 const globby = normalizeArguments(async (patterns, options) => {
-	const [
-		tasks,
-		filter,
-	] = await Promise.all([
-		generateTasks(patterns, options),
-		getFilter(options),
-	]);
+	// Apply ignore files and get filter (reads .gitignore files once)
+	const {options: modifiedOptions, filter} = await applyIgnoreFilesAndGetFilter(options);
+
+	// Generate tasks with modified options (includes gitignore patterns in ignore option)
+	const tasks = await generateTasks(patterns, modifiedOptions);
 
 	const results = await Promise.all(tasks.map(task => out(task.patterns, task.options)));
 	return unionFastGlobResults(results, filter);
 });
 
 const globbySync = normalizeArgumentsSync((patterns, options) => {
-	const tasks = generateTasksSync(patterns, options);
-	const filter = getFilterSync(options);
+	// Apply ignore files and get filter (reads .gitignore files once)
+	const {options: modifiedOptions, filter} = applyIgnoreFilesAndGetFilterSync(options);
+
+	// Generate tasks with modified options (includes gitignore patterns in ignore option)
+	const tasks = generateTasksSync(patterns, modifiedOptions);
+
 	const results = tasks.map(task => out.sync(task.patterns, task.options));
 	return unionFastGlobResults(results, filter);
 });
 
 const globbyStream = normalizeArgumentsSync((patterns, options) => {
-	const tasks = generateTasksSync(patterns, options);
-	const filter = getFilterSync(options);
+	// Apply ignore files and get filter (reads .gitignore files once)
+	const {options: modifiedOptions, filter} = applyIgnoreFilesAndGetFilterSync(options);
+
+	// Generate tasks with modified options (includes gitignore patterns in ignore option)
+	const tasks = generateTasksSync(patterns, modifiedOptions);
+
 	const streams = tasks.map(task => out.stream(task.patterns, task.options));
 
 	if (streams.length === 0) {
@@ -70444,410 +71052,182 @@ function stripAnsi(string) {
 	return string.replace(regex, '');
 }
 
+;// CONCATENATED MODULE: ./node_modules/get-east-asian-width/lookup-data.js
+// Generated by scripts/build.js
+
+// prettier-ignore
+const ambiguousRanges = [161, 161, 164, 164, 167, 168, 170, 170, 173, 174, 176, 180, 182, 186, 188, 191, 198, 198, 208, 208, 215, 216, 222, 225, 230, 230, 232, 234, 236, 237, 240, 240, 242, 243, 247, 250, 252, 252, 254, 254, 257, 257, 273, 273, 275, 275, 283, 283, 294, 295, 299, 299, 305, 307, 312, 312, 319, 322, 324, 324, 328, 331, 333, 333, 338, 339, 358, 359, 363, 363, 462, 462, 464, 464, 466, 466, 468, 468, 470, 470, 472, 472, 474, 474, 476, 476, 593, 593, 609, 609, 708, 708, 711, 711, 713, 715, 717, 717, 720, 720, 728, 731, 733, 733, 735, 735, 768, 879, 913, 929, 931, 937, 945, 961, 963, 969, 1025, 1025, 1040, 1103, 1105, 1105, 8208, 8208, 8211, 8214, 8216, 8217, 8220, 8221, 8224, 8226, 8228, 8231, 8240, 8240, 8242, 8243, 8245, 8245, 8251, 8251, 8254, 8254, 8308, 8308, 8319, 8319, 8321, 8324, 8364, 8364, 8451, 8451, 8453, 8453, 8457, 8457, 8467, 8467, 8470, 8470, 8481, 8482, 8486, 8486, 8491, 8491, 8531, 8532, 8539, 8542, 8544, 8555, 8560, 8569, 8585, 8585, 8592, 8601, 8632, 8633, 8658, 8658, 8660, 8660, 8679, 8679, 8704, 8704, 8706, 8707, 8711, 8712, 8715, 8715, 8719, 8719, 8721, 8721, 8725, 8725, 8730, 8730, 8733, 8736, 8739, 8739, 8741, 8741, 8743, 8748, 8750, 8750, 8756, 8759, 8764, 8765, 8776, 8776, 8780, 8780, 8786, 8786, 8800, 8801, 8804, 8807, 8810, 8811, 8814, 8815, 8834, 8835, 8838, 8839, 8853, 8853, 8857, 8857, 8869, 8869, 8895, 8895, 8978, 8978, 9312, 9449, 9451, 9547, 9552, 9587, 9600, 9615, 9618, 9621, 9632, 9633, 9635, 9641, 9650, 9651, 9654, 9655, 9660, 9661, 9664, 9665, 9670, 9672, 9675, 9675, 9678, 9681, 9698, 9701, 9711, 9711, 9733, 9734, 9737, 9737, 9742, 9743, 9756, 9756, 9758, 9758, 9792, 9792, 9794, 9794, 9824, 9825, 9827, 9829, 9831, 9834, 9836, 9837, 9839, 9839, 9886, 9887, 9919, 9919, 9926, 9933, 9935, 9939, 9941, 9953, 9955, 9955, 9960, 9961, 9963, 9969, 9972, 9972, 9974, 9977, 9979, 9980, 9982, 9983, 10045, 10045, 10102, 10111, 11094, 11097, 12872, 12879, 57344, 63743, 65024, 65039, 65533, 65533, 127232, 127242, 127248, 127277, 127280, 127337, 127344, 127373, 127375, 127376, 127387, 127404, 917760, 917999, 983040, 1048573, 1048576, 1114109];
+
+// prettier-ignore
+const fullwidthRanges = [12288, 12288, 65281, 65376, 65504, 65510];
+
+// prettier-ignore
+const lookup_data_halfwidthRanges = [8361, 8361, 65377, 65470, 65474, 65479, 65482, 65487, 65490, 65495, 65498, 65500, 65512, 65518];
+
+// prettier-ignore
+const lookup_data_narrowRanges = [32, 126, 162, 163, 165, 166, 172, 172, 175, 175, 10214, 10221, 10629, 10630];
+
+// prettier-ignore
+const wideRanges = [4352, 4447, 8986, 8987, 9001, 9002, 9193, 9196, 9200, 9200, 9203, 9203, 9725, 9726, 9748, 9749, 9776, 9783, 9800, 9811, 9855, 9855, 9866, 9871, 9875, 9875, 9889, 9889, 9898, 9899, 9917, 9918, 9924, 9925, 9934, 9934, 9940, 9940, 9962, 9962, 9970, 9971, 9973, 9973, 9978, 9978, 9981, 9981, 9989, 9989, 9994, 9995, 10024, 10024, 10060, 10060, 10062, 10062, 10067, 10069, 10071, 10071, 10133, 10135, 10160, 10160, 10175, 10175, 11035, 11036, 11088, 11088, 11093, 11093, 11904, 11929, 11931, 12019, 12032, 12245, 12272, 12287, 12289, 12350, 12353, 12438, 12441, 12543, 12549, 12591, 12593, 12686, 12688, 12773, 12783, 12830, 12832, 12871, 12880, 42124, 42128, 42182, 43360, 43388, 44032, 55203, 63744, 64255, 65040, 65049, 65072, 65106, 65108, 65126, 65128, 65131, 94176, 94180, 94192, 94198, 94208, 101589, 101631, 101662, 101760, 101874, 110576, 110579, 110581, 110587, 110589, 110590, 110592, 110882, 110898, 110898, 110928, 110930, 110933, 110933, 110948, 110951, 110960, 111355, 119552, 119638, 119648, 119670, 126980, 126980, 127183, 127183, 127374, 127374, 127377, 127386, 127488, 127490, 127504, 127547, 127552, 127560, 127568, 127569, 127584, 127589, 127744, 127776, 127789, 127797, 127799, 127868, 127870, 127891, 127904, 127946, 127951, 127955, 127968, 127984, 127988, 127988, 127992, 128062, 128064, 128064, 128066, 128252, 128255, 128317, 128331, 128334, 128336, 128359, 128378, 128378, 128405, 128406, 128420, 128420, 128507, 128591, 128640, 128709, 128716, 128716, 128720, 128722, 128725, 128728, 128732, 128735, 128747, 128748, 128756, 128764, 128992, 129003, 129008, 129008, 129292, 129338, 129340, 129349, 129351, 129535, 129648, 129660, 129664, 129674, 129678, 129734, 129736, 129736, 129741, 129756, 129759, 129770, 129775, 129784, 131072, 196605, 196608, 262141];
+
+
+
+;// CONCATENATED MODULE: ./node_modules/get-east-asian-width/utilities.js
+/**
+Binary search on a sorted flat array of [start, end] pairs.
+
+@param {number[]} ranges - Flat array of inclusive [start, end] range pairs, e.g. [0, 5, 10, 20].
+@param {number} codePoint - The value to search for.
+@returns {boolean} Whether the value falls within any of the ranges.
+*/
+const utilities_isInRange = (ranges, codePoint) => {
+	let low = 0;
+	let high = Math.floor(ranges.length / 2) - 1;
+	while (low <= high) {
+		const mid = Math.floor((low + high) / 2);
+		const i = mid * 2;
+		if (codePoint < ranges[i]) {
+			high = mid - 1;
+		} else if (codePoint > ranges[i + 1]) {
+			low = mid + 1;
+		} else {
+			return true;
+		}
+	}
+
+	return false;
+};
+
 ;// CONCATENATED MODULE: ./node_modules/get-east-asian-width/lookup.js
-// Generated code.
 
-function isAmbiguous(x) {
-	return x === 0xA1
-		|| x === 0xA4
-		|| x === 0xA7
-		|| x === 0xA8
-		|| x === 0xAA
-		|| x === 0xAD
-		|| x === 0xAE
-		|| x >= 0xB0 && x <= 0xB4
-		|| x >= 0xB6 && x <= 0xBA
-		|| x >= 0xBC && x <= 0xBF
-		|| x === 0xC6
-		|| x === 0xD0
-		|| x === 0xD7
-		|| x === 0xD8
-		|| x >= 0xDE && x <= 0xE1
-		|| x === 0xE6
-		|| x >= 0xE8 && x <= 0xEA
-		|| x === 0xEC
-		|| x === 0xED
-		|| x === 0xF0
-		|| x === 0xF2
-		|| x === 0xF3
-		|| x >= 0xF7 && x <= 0xFA
-		|| x === 0xFC
-		|| x === 0xFE
-		|| x === 0x101
-		|| x === 0x111
-		|| x === 0x113
-		|| x === 0x11B
-		|| x === 0x126
-		|| x === 0x127
-		|| x === 0x12B
-		|| x >= 0x131 && x <= 0x133
-		|| x === 0x138
-		|| x >= 0x13F && x <= 0x142
-		|| x === 0x144
-		|| x >= 0x148 && x <= 0x14B
-		|| x === 0x14D
-		|| x === 0x152
-		|| x === 0x153
-		|| x === 0x166
-		|| x === 0x167
-		|| x === 0x16B
-		|| x === 0x1CE
-		|| x === 0x1D0
-		|| x === 0x1D2
-		|| x === 0x1D4
-		|| x === 0x1D6
-		|| x === 0x1D8
-		|| x === 0x1DA
-		|| x === 0x1DC
-		|| x === 0x251
-		|| x === 0x261
-		|| x === 0x2C4
-		|| x === 0x2C7
-		|| x >= 0x2C9 && x <= 0x2CB
-		|| x === 0x2CD
-		|| x === 0x2D0
-		|| x >= 0x2D8 && x <= 0x2DB
-		|| x === 0x2DD
-		|| x === 0x2DF
-		|| x >= 0x300 && x <= 0x36F
-		|| x >= 0x391 && x <= 0x3A1
-		|| x >= 0x3A3 && x <= 0x3A9
-		|| x >= 0x3B1 && x <= 0x3C1
-		|| x >= 0x3C3 && x <= 0x3C9
-		|| x === 0x401
-		|| x >= 0x410 && x <= 0x44F
-		|| x === 0x451
-		|| x === 0x2010
-		|| x >= 0x2013 && x <= 0x2016
-		|| x === 0x2018
-		|| x === 0x2019
-		|| x === 0x201C
-		|| x === 0x201D
-		|| x >= 0x2020 && x <= 0x2022
-		|| x >= 0x2024 && x <= 0x2027
-		|| x === 0x2030
-		|| x === 0x2032
-		|| x === 0x2033
-		|| x === 0x2035
-		|| x === 0x203B
-		|| x === 0x203E
-		|| x === 0x2074
-		|| x === 0x207F
-		|| x >= 0x2081 && x <= 0x2084
-		|| x === 0x20AC
-		|| x === 0x2103
-		|| x === 0x2105
-		|| x === 0x2109
-		|| x === 0x2113
-		|| x === 0x2116
-		|| x === 0x2121
-		|| x === 0x2122
-		|| x === 0x2126
-		|| x === 0x212B
-		|| x === 0x2153
-		|| x === 0x2154
-		|| x >= 0x215B && x <= 0x215E
-		|| x >= 0x2160 && x <= 0x216B
-		|| x >= 0x2170 && x <= 0x2179
-		|| x === 0x2189
-		|| x >= 0x2190 && x <= 0x2199
-		|| x === 0x21B8
-		|| x === 0x21B9
-		|| x === 0x21D2
-		|| x === 0x21D4
-		|| x === 0x21E7
-		|| x === 0x2200
-		|| x === 0x2202
-		|| x === 0x2203
-		|| x === 0x2207
-		|| x === 0x2208
-		|| x === 0x220B
-		|| x === 0x220F
-		|| x === 0x2211
-		|| x === 0x2215
-		|| x === 0x221A
-		|| x >= 0x221D && x <= 0x2220
-		|| x === 0x2223
-		|| x === 0x2225
-		|| x >= 0x2227 && x <= 0x222C
-		|| x === 0x222E
-		|| x >= 0x2234 && x <= 0x2237
-		|| x === 0x223C
-		|| x === 0x223D
-		|| x === 0x2248
-		|| x === 0x224C
-		|| x === 0x2252
-		|| x === 0x2260
-		|| x === 0x2261
-		|| x >= 0x2264 && x <= 0x2267
-		|| x === 0x226A
-		|| x === 0x226B
-		|| x === 0x226E
-		|| x === 0x226F
-		|| x === 0x2282
-		|| x === 0x2283
-		|| x === 0x2286
-		|| x === 0x2287
-		|| x === 0x2295
-		|| x === 0x2299
-		|| x === 0x22A5
-		|| x === 0x22BF
-		|| x === 0x2312
-		|| x >= 0x2460 && x <= 0x24E9
-		|| x >= 0x24EB && x <= 0x254B
-		|| x >= 0x2550 && x <= 0x2573
-		|| x >= 0x2580 && x <= 0x258F
-		|| x >= 0x2592 && x <= 0x2595
-		|| x === 0x25A0
-		|| x === 0x25A1
-		|| x >= 0x25A3 && x <= 0x25A9
-		|| x === 0x25B2
-		|| x === 0x25B3
-		|| x === 0x25B6
-		|| x === 0x25B7
-		|| x === 0x25BC
-		|| x === 0x25BD
-		|| x === 0x25C0
-		|| x === 0x25C1
-		|| x >= 0x25C6 && x <= 0x25C8
-		|| x === 0x25CB
-		|| x >= 0x25CE && x <= 0x25D1
-		|| x >= 0x25E2 && x <= 0x25E5
-		|| x === 0x25EF
-		|| x === 0x2605
-		|| x === 0x2606
-		|| x === 0x2609
-		|| x === 0x260E
-		|| x === 0x260F
-		|| x === 0x261C
-		|| x === 0x261E
-		|| x === 0x2640
-		|| x === 0x2642
-		|| x === 0x2660
-		|| x === 0x2661
-		|| x >= 0x2663 && x <= 0x2665
-		|| x >= 0x2667 && x <= 0x266A
-		|| x === 0x266C
-		|| x === 0x266D
-		|| x === 0x266F
-		|| x === 0x269E
-		|| x === 0x269F
-		|| x === 0x26BF
-		|| x >= 0x26C6 && x <= 0x26CD
-		|| x >= 0x26CF && x <= 0x26D3
-		|| x >= 0x26D5 && x <= 0x26E1
-		|| x === 0x26E3
-		|| x === 0x26E8
-		|| x === 0x26E9
-		|| x >= 0x26EB && x <= 0x26F1
-		|| x === 0x26F4
-		|| x >= 0x26F6 && x <= 0x26F9
-		|| x === 0x26FB
-		|| x === 0x26FC
-		|| x === 0x26FE
-		|| x === 0x26FF
-		|| x === 0x273D
-		|| x >= 0x2776 && x <= 0x277F
-		|| x >= 0x2B56 && x <= 0x2B59
-		|| x >= 0x3248 && x <= 0x324F
-		|| x >= 0xE000 && x <= 0xF8FF
-		|| x >= 0xFE00 && x <= 0xFE0F
-		|| x === 0xFFFD
-		|| x >= 0x1F100 && x <= 0x1F10A
-		|| x >= 0x1F110 && x <= 0x1F12D
-		|| x >= 0x1F130 && x <= 0x1F169
-		|| x >= 0x1F170 && x <= 0x1F18D
-		|| x === 0x1F18F
-		|| x === 0x1F190
-		|| x >= 0x1F19B && x <= 0x1F1AC
-		|| x >= 0xE0100 && x <= 0xE01EF
-		|| x >= 0xF0000 && x <= 0xFFFFD
-		|| x >= 0x100000 && x <= 0x10FFFD;
+
+
+const minimumAmbiguousCodePoint = ambiguousRanges[0];
+const maximumAmbiguousCodePoint = ambiguousRanges.at(-1);
+const minimumFullWidthCodePoint = fullwidthRanges[0];
+const maximumFullWidthCodePoint = fullwidthRanges.at(-1);
+const minimumHalfWidthCodePoint = lookup_data_halfwidthRanges[0];
+const maximumHalfWidthCodePoint = lookup_data_halfwidthRanges.at(-1);
+const minimumNarrowCodePoint = lookup_data_narrowRanges[0];
+const maximumNarrowCodePoint = lookup_data_narrowRanges.at(-1);
+const minimumWideCodePoint = wideRanges[0];
+const maximumWideCodePoint = wideRanges.at(-1);
+
+const commonCjkCodePoint = 0x4E_00;
+const [wideFastPathStart, wideFastPathEnd] = findWideFastPathRange(wideRanges);
+
+// Use a hot-path range so common `isWide` calls can skip binary search.
+// The range containing U+4E00 covers common CJK ideographs;
+// fallback to the largest range for resilience to Unicode table changes.
+function findWideFastPathRange(ranges) {
+	let fastPathStart = ranges[0];
+	let fastPathEnd = ranges[1];
+
+	for (let index = 0; index < ranges.length; index += 2) {
+		const start = ranges[index];
+		const end = ranges[index + 1];
+
+		if (
+			commonCjkCodePoint >= start
+			&& commonCjkCodePoint <= end
+		) {
+			return [start, end];
+		}
+
+		if ((end - start) > (fastPathEnd - fastPathStart)) {
+			fastPathStart = start;
+			fastPathEnd = end;
+		}
+	}
+
+	return [fastPathStart, fastPathEnd];
 }
 
-function isFullWidth(x) {
-	return x === 0x3000
-		|| x >= 0xFF01 && x <= 0xFF60
-		|| x >= 0xFFE0 && x <= 0xFFE6;
-}
+const isAmbiguous = codePoint => {
+	if (
+		codePoint < minimumAmbiguousCodePoint
+		|| codePoint > maximumAmbiguousCodePoint
+	) {
+		return false;
+	}
 
-function isWide(x) {
-	return x >= 0x1100 && x <= 0x115F
-		|| x === 0x231A
-		|| x === 0x231B
-		|| x === 0x2329
-		|| x === 0x232A
-		|| x >= 0x23E9 && x <= 0x23EC
-		|| x === 0x23F0
-		|| x === 0x23F3
-		|| x === 0x25FD
-		|| x === 0x25FE
-		|| x === 0x2614
-		|| x === 0x2615
-		|| x >= 0x2630 && x <= 0x2637
-		|| x >= 0x2648 && x <= 0x2653
-		|| x === 0x267F
-		|| x >= 0x268A && x <= 0x268F
-		|| x === 0x2693
-		|| x === 0x26A1
-		|| x === 0x26AA
-		|| x === 0x26AB
-		|| x === 0x26BD
-		|| x === 0x26BE
-		|| x === 0x26C4
-		|| x === 0x26C5
-		|| x === 0x26CE
-		|| x === 0x26D4
-		|| x === 0x26EA
-		|| x === 0x26F2
-		|| x === 0x26F3
-		|| x === 0x26F5
-		|| x === 0x26FA
-		|| x === 0x26FD
-		|| x === 0x2705
-		|| x === 0x270A
-		|| x === 0x270B
-		|| x === 0x2728
-		|| x === 0x274C
-		|| x === 0x274E
-		|| x >= 0x2753 && x <= 0x2755
-		|| x === 0x2757
-		|| x >= 0x2795 && x <= 0x2797
-		|| x === 0x27B0
-		|| x === 0x27BF
-		|| x === 0x2B1B
-		|| x === 0x2B1C
-		|| x === 0x2B50
-		|| x === 0x2B55
-		|| x >= 0x2E80 && x <= 0x2E99
-		|| x >= 0x2E9B && x <= 0x2EF3
-		|| x >= 0x2F00 && x <= 0x2FD5
-		|| x >= 0x2FF0 && x <= 0x2FFF
-		|| x >= 0x3001 && x <= 0x303E
-		|| x >= 0x3041 && x <= 0x3096
-		|| x >= 0x3099 && x <= 0x30FF
-		|| x >= 0x3105 && x <= 0x312F
-		|| x >= 0x3131 && x <= 0x318E
-		|| x >= 0x3190 && x <= 0x31E5
-		|| x >= 0x31EF && x <= 0x321E
-		|| x >= 0x3220 && x <= 0x3247
-		|| x >= 0x3250 && x <= 0xA48C
-		|| x >= 0xA490 && x <= 0xA4C6
-		|| x >= 0xA960 && x <= 0xA97C
-		|| x >= 0xAC00 && x <= 0xD7A3
-		|| x >= 0xF900 && x <= 0xFAFF
-		|| x >= 0xFE10 && x <= 0xFE19
-		|| x >= 0xFE30 && x <= 0xFE52
-		|| x >= 0xFE54 && x <= 0xFE66
-		|| x >= 0xFE68 && x <= 0xFE6B
-		|| x >= 0x16FE0 && x <= 0x16FE4
-		|| x >= 0x16FF0 && x <= 0x16FF6
-		|| x >= 0x17000 && x <= 0x18CD5
-		|| x >= 0x18CFF && x <= 0x18D1E
-		|| x >= 0x18D80 && x <= 0x18DF2
-		|| x >= 0x1AFF0 && x <= 0x1AFF3
-		|| x >= 0x1AFF5 && x <= 0x1AFFB
-		|| x === 0x1AFFD
-		|| x === 0x1AFFE
-		|| x >= 0x1B000 && x <= 0x1B122
-		|| x === 0x1B132
-		|| x >= 0x1B150 && x <= 0x1B152
-		|| x === 0x1B155
-		|| x >= 0x1B164 && x <= 0x1B167
-		|| x >= 0x1B170 && x <= 0x1B2FB
-		|| x >= 0x1D300 && x <= 0x1D356
-		|| x >= 0x1D360 && x <= 0x1D376
-		|| x === 0x1F004
-		|| x === 0x1F0CF
-		|| x === 0x1F18E
-		|| x >= 0x1F191 && x <= 0x1F19A
-		|| x >= 0x1F200 && x <= 0x1F202
-		|| x >= 0x1F210 && x <= 0x1F23B
-		|| x >= 0x1F240 && x <= 0x1F248
-		|| x === 0x1F250
-		|| x === 0x1F251
-		|| x >= 0x1F260 && x <= 0x1F265
-		|| x >= 0x1F300 && x <= 0x1F320
-		|| x >= 0x1F32D && x <= 0x1F335
-		|| x >= 0x1F337 && x <= 0x1F37C
-		|| x >= 0x1F37E && x <= 0x1F393
-		|| x >= 0x1F3A0 && x <= 0x1F3CA
-		|| x >= 0x1F3CF && x <= 0x1F3D3
-		|| x >= 0x1F3E0 && x <= 0x1F3F0
-		|| x === 0x1F3F4
-		|| x >= 0x1F3F8 && x <= 0x1F43E
-		|| x === 0x1F440
-		|| x >= 0x1F442 && x <= 0x1F4FC
-		|| x >= 0x1F4FF && x <= 0x1F53D
-		|| x >= 0x1F54B && x <= 0x1F54E
-		|| x >= 0x1F550 && x <= 0x1F567
-		|| x === 0x1F57A
-		|| x === 0x1F595
-		|| x === 0x1F596
-		|| x === 0x1F5A4
-		|| x >= 0x1F5FB && x <= 0x1F64F
-		|| x >= 0x1F680 && x <= 0x1F6C5
-		|| x === 0x1F6CC
-		|| x >= 0x1F6D0 && x <= 0x1F6D2
-		|| x >= 0x1F6D5 && x <= 0x1F6D8
-		|| x >= 0x1F6DC && x <= 0x1F6DF
-		|| x === 0x1F6EB
-		|| x === 0x1F6EC
-		|| x >= 0x1F6F4 && x <= 0x1F6FC
-		|| x >= 0x1F7E0 && x <= 0x1F7EB
-		|| x === 0x1F7F0
-		|| x >= 0x1F90C && x <= 0x1F93A
-		|| x >= 0x1F93C && x <= 0x1F945
-		|| x >= 0x1F947 && x <= 0x1F9FF
-		|| x >= 0x1FA70 && x <= 0x1FA7C
-		|| x >= 0x1FA80 && x <= 0x1FA8A
-		|| x >= 0x1FA8E && x <= 0x1FAC6
-		|| x === 0x1FAC8
-		|| x >= 0x1FACD && x <= 0x1FADC
-		|| x >= 0x1FADF && x <= 0x1FAEA
-		|| x >= 0x1FAEF && x <= 0x1FAF8
-		|| x >= 0x20000 && x <= 0x2FFFD
-		|| x >= 0x30000 && x <= 0x3FFFD;
-}
+	return utilities_isInRange(ambiguousRanges, codePoint);
+};
 
-function lookup_getCategory(x) {
-	if (isAmbiguous(x)) return 'ambiguous';
+const isFullWidth = codePoint => {
+	if (
+		codePoint < minimumFullWidthCodePoint
+		|| codePoint > maximumFullWidthCodePoint
+	) {
+		return false;
+	}
 
-	if (isFullWidth(x)) return 'fullwidth';
+	return utilities_isInRange(fullwidthRanges, codePoint);
+};
+
+const isHalfWidth = codePoint => {
+	if (
+		codePoint < minimumHalfWidthCodePoint
+		|| codePoint > maximumHalfWidthCodePoint
+	) {
+		return false;
+	}
+
+	return isInRange(halfwidthRanges, codePoint);
+};
+
+const isNarrow = codePoint => {
+	if (
+		codePoint < minimumNarrowCodePoint
+		|| codePoint > maximumNarrowCodePoint
+	) {
+		return false;
+	}
+
+	return isInRange(narrowRanges, codePoint);
+};
+
+const isWide = codePoint => {
+	if (
+		codePoint >= wideFastPathStart
+		&& codePoint <= wideFastPathEnd
+	) {
+		return true;
+	}
 
 	if (
-		x === 0x20A9
-		|| x >= 0xFF61 && x <= 0xFFBE
-		|| x >= 0xFFC2 && x <= 0xFFC7
-		|| x >= 0xFFCA && x <= 0xFFCF
-		|| x >= 0xFFD2 && x <= 0xFFD7
-		|| x >= 0xFFDA && x <= 0xFFDC
-		|| x >= 0xFFE8 && x <= 0xFFEE
+		codePoint < minimumWideCodePoint
+		|| codePoint > maximumWideCodePoint
 	) {
+		return false;
+	}
+
+	return utilities_isInRange(wideRanges, codePoint);
+};
+
+function lookup_getCategory(codePoint) {
+	if (isAmbiguous(codePoint)) {
+		return 'ambiguous';
+	}
+
+	if (isFullWidth(codePoint)) {
+		return 'fullwidth';
+	}
+
+	if (isHalfWidth(codePoint)) {
 		return 'halfwidth';
 	}
 
-	if (
-		x >= 0x20 && x <= 0x7E
-		|| x === 0xA2
-		|| x === 0xA3
-		|| x === 0xA5
-		|| x === 0xA6
-		|| x === 0xAC
-		|| x === 0xAF
-		|| x >= 0x27E6 && x <= 0x27ED
-		|| x === 0x2985
-		|| x === 0x2986
-	) {
+	if (isNarrow(codePoint)) {
 		return 'narrow';
 	}
 
-	if (isWide(x)) return 'wide';
+	if (isWide(codePoint)) {
+		return 'wide';
+	}
 
 	return 'neutral';
 }
-
-
 
 ;// CONCATENATED MODULE: ./node_modules/get-east-asian-width/index.js
 
@@ -77016,7 +77396,7 @@ const pathPosix = external_node_path_namespaceObject.posix;
 
 // Variables
 const packageName = "markdownlint-cli2";
-const packageVersion = "0.20.0";
+const packageVersion = "0.21.0";
 const libraryName = "markdownlint";
 const libraryVersion = getVersion();
 const bannerMessage = `${packageName} v${packageVersion} (${libraryName} v${libraryVersion})`;
@@ -77044,20 +77424,6 @@ const posixPath = (/** @type {string} */ p) => p.split(external_node_path_namesp
 const resolveModulePaths = (/** @type {string} */ dir, /** @type {string[]} */ modulePaths) => (
   modulePaths.map((path) => external_node_path_namespaceObject.resolve(dir, (0,helpers_helpers.expandTildePath)(path, external_node_os_namespaceObject)))
 );
-
-// Read a JSON(C) or YAML file and return the object
-const readConfigFile = (/** @type {FsLike} */ fs, /** @type {string} */ dir, /** @type {string} */ name, /** @type {() => void} */ otherwise) => () => {
-  const file = pathPosix.join(dir, name);
-  return fs.promises.access(file).
-    then(
-      () => readConfigPromise(
-        file,
-        parsers_parsers,
-        fs
-      ),
-      otherwise
-    );
-};
 
 // Import a module ID with a custom directory in the path
 const importModule = async (/** @type {string[] | string} */ dirOrDirs, /** @type {string} */ id, /** @type {boolean} */ noImport) => {
@@ -77113,18 +77479,8 @@ const importModuleIdsAndParams = (/** @type {string[]} */ dirs, /** @type {strin
   ).then((results) => results.filter(Boolean))
 );
 
-// Import a JavaScript file and return the exported object
-const importConfig = (/** @type {FsLike} */ fs, /** @type {string} */ dir, /** @type {string} */ name, /** @type {boolean} */ noImport, /** @type {() => void} */ otherwise) => () => {
-  const file = pathPosix.join(dir, name);
-  return fs.promises.access(file).
-    then(
-      () => importModule(dir, name, noImport),
-      otherwise
-    );
-};
-
 // Extend a config object if it has 'extends' property
-const getExtendedConfig = (/** @type {import("markdownlint").Configuration} */ config, /** @type {string} */ configPath, /** @type {FsLike} */ fs) => {
+const getExtendedConfig = (/** @type {Configuration} */ config, /** @type {string} */ configPath, /** @type {FsLike} */ fs) => {
   if (config.extends) {
     return extendConfigPromise(
       config,
@@ -77270,6 +77626,54 @@ $ markdownlint-cli2 "**/*.md" "#node_modules"`
   return 2;
 };
 
+// Helpers for getAndProcessDirInfo/handleFirstMatchingConfigurationFile
+const readFileParseJson = (/** @type {ConfigurationHandlerParams} */ { file, fs }) => fs.promises.readFile(file, utf8).then(jsonc_parse);
+const readFileParseYaml = (/** @type {ConfigurationHandlerParams} */ { file, fs }) => fs.promises.readFile(file, utf8).then(yaml_parse);
+const readConfigWrapper = (/** @type {ConfigurationHandlerParams} */ { file, fs }) => readConfigPromise(file, parsers_parsers, fs);
+const importModuleWrapper = (/** @type {ConfigurationHandlerParams} */ { dir, file, noImport }) => importModule(dir, file, noImport);
+
+/** @type {ConfigurationFileAndHandler[] } */
+const optionsFiles = [
+  [ ".markdownlint-cli2.jsonc", readFileParseJson ],
+  [ ".markdownlint-cli2.yaml", readFileParseYaml ],
+  [ ".markdownlint-cli2.cjs", importModuleWrapper ],
+  [ ".markdownlint-cli2.mjs", importModuleWrapper ],
+  [ "package.json", (params) => readFileParseJson(params).then((/** @type {any} */ obj) => (obj || {})[packageName]) ]
+];
+
+/** @type {ConfigurationFileAndHandler[] } */
+const configurationFiles = [
+  [ ".markdownlint.jsonc", readConfigWrapper ],
+  [ ".markdownlint.json", readConfigWrapper ],
+  [ ".markdownlint.yaml", readConfigWrapper ],
+  [ ".markdownlint.yml", readConfigWrapper ],
+  [ ".markdownlint.cjs", importModuleWrapper ],
+  [ ".markdownlint.mjs", importModuleWrapper ]
+];
+
+/**
+ * Processes the first matching configuration file.
+ * @param {ConfigurationFileAndHandler[]} fileAndHandlers List of configuration files and handlers.
+ * @param {string} dir Configuration file directory.
+ * @param {FsLike} fs File system object.
+ * @param {boolean} noImport No import.
+ * @param {(file: string) => void} memoizeFile Function to memoize file name.
+ * @returns {Promise<any>} Configuration file content.
+ */
+const processFirstMatchingConfigurationFile = (fileAndHandlers, dir, fs, noImport, memoizeFile) =>
+  Promise.allSettled(
+    fileAndHandlers.map(([ name, handler ]) => {
+      const file = pathPosix.join(dir, name);
+      return fs.promises.access(file).then(() => [ file, handler ]);
+    })
+  ).
+    then((values) => {
+      /** @type {ConfigurationFileAndHandler} */
+      const [ file, handler ] = values.find((result) => (result.status === "fulfilled"))?.value || [ "[UNUSED]", markdownlint_cli2_noop ];
+      memoizeFile(file);
+      return handler({ dir, file, fs, noImport });
+    });
+
 // Get (creating if necessary) and process a directory's info object
 const getAndProcessDirInfo = (
   /** @type {FsLike} */ fs,
@@ -77288,57 +77692,30 @@ const getAndProcessDirInfo = (
       relativeDir,
       "parent": null,
       "files": [],
-      "markdownlintConfig": {},
-      "markdownlintOptions": {}
+      "markdownlintConfig": null,
+      "markdownlintOptions": null
     };
     dirToDirInfo[dir] = dirInfo;
 
-    // Load markdownlint-cli2 object(s)
-    const markdownlintCli2Jsonc = pathPosix.join(dir, ".markdownlint-cli2.jsonc");
-    const markdownlintCli2Yaml = pathPosix.join(dir, ".markdownlint-cli2.yaml");
-    const markdownlintCli2Cjs = pathPosix.join(dir, ".markdownlint-cli2.cjs");
-    const markdownlintCli2Mjs = pathPosix.join(dir, ".markdownlint-cli2.mjs");
-    const packageJson = pathPosix.join(dir, "package.json");
-    let file = "[UNKNOWN]";
-    // eslint-disable-next-line no-return-assign
-    const captureFile = (/** @type {string} */ f) => file = f;
+    let cli2File = "[UNKNOWN]";
     tasks.push(
-      fs.promises.access(captureFile(markdownlintCli2Jsonc)).
-        then(
-          () => fs.promises.readFile(file, utf8).then(jsonc_parse),
-          () => fs.promises.access(captureFile(markdownlintCli2Yaml)).
-            then(
-              () => fs.promises.readFile(file, utf8).then(yaml_parse),
-              () => fs.promises.access(captureFile(markdownlintCli2Cjs)).
-                then(
-                  () => importModule(dir, file, noImport),
-                  () => fs.promises.access(captureFile(markdownlintCli2Mjs)).
-                    then(
-                      () => importModule(dir, file, noImport),
-                      () => (allowPackageJson
-                        ? fs.promises.access(captureFile(packageJson))
-                        // eslint-disable-next-line prefer-promise-reject-errors
-                        : Promise.reject()
-                      ).
-                        then(
-                          () => fs.promises.
-                            readFile(file, utf8).
-                            then(jsonc_parse).
-                            then((/** @type {any} */ obj) => obj[packageName]),
-                          markdownlint_cli2_noop
-                        )
-                    )
-                )
-            )
-        ).
-        then((/** @type {Options} */ options) => {
+
+      // Load markdownlint-cli2 object(s)
+      processFirstMatchingConfigurationFile(
+        allowPackageJson ? optionsFiles : optionsFiles.slice(0, -1),
+        dir,
+        fs,
+        noImport,
+        (file) => { cli2File = file; }
+      ).
+        then((/** @type {Options | null} */ options) => {
           dirInfo.markdownlintOptions = options;
           return options &&
             options.config &&
             getExtendedConfig(
               options.config,
-              // Just need to identify a file in the right directory
-              markdownlintCli2Jsonc,
+              // Just need to identify the right directory
+              pathPosix.join(dir, utf8),
               fs
             ).
               then((config) => {
@@ -77346,48 +77723,12 @@ const getAndProcessDirInfo = (
               });
         }).
         catch((/** @type {Error} */ error) => {
-          throwForConfigurationFile(file, error);
-        })
-    );
+          throwForConfigurationFile(cli2File, error);
+        }),
 
-    // Load markdownlint object(s)
-    const readConfigs =
-      readConfigFile(
-        fs,
-        dir,
-        ".markdownlint.jsonc",
-        readConfigFile(
-          fs,
-          dir,
-          ".markdownlint.json",
-          readConfigFile(
-            fs,
-            dir,
-            ".markdownlint.yaml",
-            readConfigFile(
-              fs,
-              dir,
-              ".markdownlint.yml",
-              importConfig(
-                fs,
-                dir,
-                ".markdownlint.cjs",
-                noImport,
-                importConfig(
-                  fs,
-                  dir,
-                  ".markdownlint.mjs",
-                  noImport,
-                  markdownlint_cli2_noop
-                )
-              )
-            )
-          )
-        )
-      );
-    tasks.push(
-      readConfigs().
-        then((/** @type {import("markdownlint").Configuration} */ config) => {
+      // Load markdownlint object(s)
+      processFirstMatchingConfigurationFile(configurationFiles, dir, fs, noImport, markdownlint_cli2_noop).
+        then((/** @type {Configuration | null} */ config) => {
           dirInfo.markdownlintConfig = config;
         })
     );
@@ -77468,7 +77809,7 @@ const enumerateFiles = async (
     "absolute": true,
     "cwd": baseDir,
     "dot": true,
-    "expandDirectories": false,
+    "expandNegationOnlyPatterns": false,
     gitignore,
     ignoreFiles,
     "suppressErrors": true,
@@ -77496,29 +77837,9 @@ const enumerateFiles = async (
     ((literalFiles.length > 0) && (globsForIgnore.length > 0))
       ? removeIgnoredFiles(baseDir, literalFiles, globsForIgnore)
       : literalFiles;
-  // Manually expand directories to avoid globby call to dir-glob.sync
-  const expandedDirectories = await Promise.all(
-    filteredGlobPatterns.map((globPattern) => {
-      const barePattern =
-        globPattern.startsWith("!")
-          ? globPattern.slice(1)
-          : globPattern;
-      const globPath = (
-        pathPosix.isAbsolute(barePattern) ||
-        external_node_path_namespaceObject.isAbsolute(barePattern)
-      )
-        ? barePattern
-        : pathPosix.join(baseDir, barePattern);
-      return fs.promises.stat(globPath).
-        then((/** @type {import("node:fs").Stats} */ stats) => (stats.isDirectory()
-          ? pathPosix.join(globPattern, "**")
-          : globPattern)).
-        catch(() => globPattern);
-    })
-  );
   // Process glob patterns
   const files = [
-    ...await globby(expandedDirectories, globbyOptions),
+    ...await globby(filteredGlobPatterns, globbyOptions),
     ...filteredLiteralFiles
   ];
   for (const file of files) {
@@ -77699,8 +78020,7 @@ const createDirInfos = async (
 
   // Merge configuration by inheritance
   for (const dirInfo of dirInfos) {
-    let markdownlintOptions = dirInfo.markdownlintOptions || {};
-    let { markdownlintConfig } = dirInfo;
+    let { markdownlintConfig, markdownlintOptions } = dirInfo;
     /** @type {DirInfo | null} */
     let parent = dirInfo;
     // eslint-disable-next-line prefer-destructuring
@@ -77714,7 +78034,7 @@ const createDirInfos = async (
       if (
         !markdownlintConfig &&
         parent.markdownlintConfig &&
-        !markdownlintOptions.config
+        !markdownlintOptions?.config
       ) {
         // eslint-disable-next-line prefer-destructuring
         markdownlintConfig = parent.markdownlintConfig;
@@ -77738,6 +78058,7 @@ const lintFiles = (/** @type {FsLike} */ fs, /** @type {DirInfo[]} */ dirInfos, 
     // Filter file/string inputs to only those in the dirInfo
     let filesAfterIgnores = files;
     if (
+      markdownlintOptions &&
       markdownlintOptions.ignores &&
       (markdownlintOptions.ignores.length > 0)
     ) {
@@ -77761,7 +78082,7 @@ const lintFiles = (/** @type {FsLike} */ fs, /** @type {DirInfo[]} */ dirInfos, 
       // eslint-disable-next-line no-inline-comments
       const module = await Promise.resolve(/* import() eager */).then(__nccwpck_require__.bind(__nccwpck_require__, 9193));
       const markdownIt = module.default({ "html": true });
-      for (const plugin of (markdownlintOptions.markdownItPlugins || [])) {
+      for (const plugin of (markdownlintOptions?.markdownItPlugins || [])) {
         // @ts-ignore
         markdownIt.use(...plugin);
       }
@@ -77772,16 +78093,16 @@ const lintFiles = (/** @type {FsLike} */ fs, /** @type {DirInfo[]} */ dirInfos, 
     const options = {
       "files": filteredFiles,
       "strings": filteredStrings,
-      "config": markdownlintConfig || markdownlintOptions.config,
+      "config": markdownlintConfig || markdownlintOptions?.config,
       "configParsers": parsers_parsers,
       // @ts-ignore
       "customRules": markdownlintOptions.customRules,
-      "frontMatter": markdownlintOptions.frontMatter
-        ? new RegExp(markdownlintOptions.frontMatter, "u")
+      "frontMatter": markdownlintOptions?.frontMatter
+        ? new RegExp(markdownlintOptions?.frontMatter, "u")
         : undefined,
       "handleRuleFailures": true,
       markdownItFactory,
-      "noInlineConfig": Boolean(markdownlintOptions.noInlineConfig),
+      "noInlineConfig": Boolean(markdownlintOptions?.noInlineConfig),
       fs
     };
     // Invoke markdownlint
@@ -77794,7 +78115,7 @@ const lintFiles = (/** @type {FsLike} */ fs, /** @type {DirInfo[]} */ dirInfos, 
         formattingContext.formatted = applyFixes(original, errorInfos);
         return {};
       });
-    } else if (markdownlintOptions.fix) {
+    } else if (markdownlintOptions?.fix) {
       // For any fixable errors, read file, apply fixes, write it back, and re-lint
       task = task.then((results) => {
         options.files = [];
@@ -77831,7 +78152,7 @@ const lintFiles = (/** @type {FsLike} */ fs, /** @type {DirInfo[]} */ dirInfos, 
 };
 
 // Create list of results
-const createResults = (/** @type {string} */ baseDir, /** @type {import("markdownlint").LintResults[]} */ taskResults) => {
+const createResults = (/** @type {string} */ baseDir, /** @type {LintResults[]} */ taskResults) => {
   /** @type {LintResult[]} */
   const results = [];
   /** @type {Map<LintResult, number>} */
@@ -78021,13 +78342,10 @@ const markdownlint_cli2_main = async (/** @type {Parameters} */ params) => {
     logMessage(`Finding: ${globPatterns.join(" ")}`);
   }
   // Create linting tasks
-  const gitignore =
-    // https://github.com/sindresorhus/globby/issues/265
-    (!params.fs && (baseMarkdownlintOptions.gitignore === true));
-  const ignoreFiles =
-    (!params.fs && (typeof baseMarkdownlintOptions.gitignore === "string"))
-      ? baseMarkdownlintOptions.gitignore
-      : undefined;
+  const gitignore = (baseMarkdownlintOptions.gitignore === true);
+  const ignoreFiles = (typeof baseMarkdownlintOptions.gitignore === "string")
+    ? baseMarkdownlintOptions.gitignore
+    : undefined;
   const dirInfos =
     await createDirInfos(
       fs,
@@ -78117,14 +78435,26 @@ const markdownlint_cli2_main = async (/** @type {Parameters} */ params) => {
  * @property {Options} [optionsOverride] Options override.
  */
 
+/** @typedef {import("markdownlint").Configuration} Configuration */
+
+/**
+ * @typedef ConfigurationHandlerParams
+ * @property {string} dir Configuration file directory.
+ * @property {string} file Configuration file.
+ * @property {FsLike} fs File system object.
+ * @property {boolean} noImport No import.
+ */
+
+/** @typedef {[ string, (params: ConfigurationHandlerParams) => Promise<any> ] } ConfigurationFileAndHandler */
+
 /**
  * @typedef DirInfo
  * @property {string} dir Directory.
  * @property {string | null} relativeDir Relative directory.
  * @property {DirInfo | null} parent Parent.
  * @property {string[]} files Files.
- * @property {import("markdownlint").Configuration} markdownlintConfig Configuration.
- * @property {Options} markdownlintOptions Options.
+ * @property {Configuration | null} markdownlintConfig Configuration.
+ * @property {Options | null} markdownlintOptions Options.
  */
 
 /** @typedef {Record<string, DirInfo>} DirToDirInfo */
@@ -78133,10 +78463,12 @@ const markdownlint_cli2_main = async (/** @type {Parameters} */ params) => {
 
 /** @typedef {[string]} OutputFormatterConfiguration */
 
+/** @typedef {import("markdownlint").Rule} Rule */
+
 /**
  * @typedef Options
- * @property {import("markdownlint").Configuration} [config] Config.
- * @property {import("markdownlint").Rule[] | string[]} [customRules] Custom rules.
+ * @property {Configuration} [config] Config.
+ * @property {Rule[] | string[]} [customRules] Custom rules.
  * @property {boolean} [fix] Fix.
  * @property {string} [frontMatter] Front matter.
  * @property {boolean | string} [gitignore] Git ignore.
@@ -78157,6 +78489,8 @@ const markdownlint_cli2_main = async (/** @type {Parameters} */ params) => {
  */
 
 /** @typedef {import("markdownlint").LintError & LintContext} LintResult */
+
+/** @typedef {import("markdownlint").LintResults} LintResults */
 
 /**
  * @typedef FormattingContext
