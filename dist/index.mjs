@@ -6402,6 +6402,113 @@ module.exports = function(num) {
 
 /***/ }),
 
+/***/ 3976:
+/***/ ((__unused_webpack_module, exports) => {
+
+var hasExcape = /~/
+var escapeMatcher = /~[01]/g
+function escapeReplacer (m) {
+  switch (m) {
+    case '~1': return '/'
+    case '~0': return '~'
+  }
+  throw new Error('Invalid tilde escape: ' + m)
+}
+
+function untilde (str) {
+  if (!hasExcape.test(str)) return str
+  return str.replace(escapeMatcher, escapeReplacer)
+}
+
+function setter (obj, pointer, value) {
+  var part
+  var hasNextPart
+
+  for (var p = 1, len = pointer.length; p < len;) {
+    if (pointer[p] === 'constructor' || pointer[p] === 'prototype' || pointer[p] === '__proto__') return obj
+
+    part = untilde(pointer[p++])
+    hasNextPart = len > p
+
+    if (typeof obj[part] === 'undefined') {
+      // support setting of /-
+      if (Array.isArray(obj) && part === '-') {
+        part = obj.length
+      }
+
+      // support nested objects/array when setting values
+      if (hasNextPart) {
+        if ((pointer[p] !== '' && pointer[p] < Infinity) || pointer[p] === '-') obj[part] = []
+        else obj[part] = {}
+      }
+    }
+
+    if (!hasNextPart) break
+    obj = obj[part]
+  }
+
+  var oldValue = obj[part]
+  if (value === undefined) delete obj[part]
+  else obj[part] = value
+  return oldValue
+}
+
+function compilePointer (pointer) {
+  if (typeof pointer === 'string') {
+    pointer = pointer.split('/')
+    if (pointer[0] === '') return pointer
+    throw new Error('Invalid JSON pointer.')
+  } else if (Array.isArray(pointer)) {
+    for (const part of pointer) {
+      if (typeof part !== 'string' && typeof part !== 'number') {
+        throw new Error('Invalid JSON pointer. Must be of type string or number.')
+      }
+    }
+    return pointer
+  }
+
+  throw new Error('Invalid JSON pointer.')
+}
+
+function get (obj, pointer) {
+  if (typeof obj !== 'object') throw new Error('Invalid input object.')
+  pointer = compilePointer(pointer)
+  var len = pointer.length
+  if (len === 1) return obj
+
+  for (var p = 1; p < len;) {
+    obj = obj[untilde(pointer[p++])]
+    if (len === p) return obj
+    if (typeof obj !== 'object' || obj === null) return undefined
+  }
+}
+
+function set (obj, pointer, value) {
+  if (typeof obj !== 'object') throw new Error('Invalid input object.')
+  pointer = compilePointer(pointer)
+  if (pointer.length === 0) throw new Error('Invalid JSON pointer for set.')
+  return setter(obj, pointer, value)
+}
+
+function compile (pointer) {
+  var compiled = compilePointer(pointer)
+  return {
+    get: function (object) {
+      return get(object, compiled)
+    },
+    set: function (object, value) {
+      return set(object, compiled, value)
+    }
+  }
+}
+
+exports.get = get
+exports.set = set
+exports.compile = compile
+
+
+/***/ }),
+
 /***/ 7928:
 /***/ ((module) => {
 
@@ -7085,6 +7192,8 @@ const path = __nccwpck_require__(6928);
 const WIN_SLASH = '\\\\/';
 const WIN_NO_SLASH = `[^${WIN_SLASH}]`;
 
+const DEFAULT_MAX_EXTGLOB_RECURSION = 0;
+
 /**
  * Posix glob regex
  */
@@ -7148,6 +7257,7 @@ const WINDOWS_CHARS = {
  */
 
 const POSIX_REGEX_SOURCE = {
+  __proto__: null,
   alnum: 'a-zA-Z0-9',
   alpha: 'a-zA-Z',
   ascii: '\\x00-\\x7F',
@@ -7165,6 +7275,7 @@ const POSIX_REGEX_SOURCE = {
 };
 
 module.exports = {
+  DEFAULT_MAX_EXTGLOB_RECURSION,
   MAX_LENGTH: 1024 * 64,
   POSIX_REGEX_SOURCE,
 
@@ -7178,6 +7289,7 @@ module.exports = {
 
   // Replace globs with equivalent patterns to reduce parsing time.
   REPLACEMENTS: {
+    __proto__: null,
     '***': '*',
     '**/**': '**',
     '**/**/**': '**'
@@ -7310,6 +7422,277 @@ const expandRange = (args, options) => {
 
 const syntaxError = (type, char) => {
   return `Missing ${type}: "${char}" - use "\\\\${char}" to match literal characters`;
+};
+
+const splitTopLevel = input => {
+  const parts = [];
+  let bracket = 0;
+  let paren = 0;
+  let quote = 0;
+  let value = '';
+  let escaped = false;
+
+  for (const ch of input) {
+    if (escaped === true) {
+      value += ch;
+      escaped = false;
+      continue;
+    }
+
+    if (ch === '\\') {
+      value += ch;
+      escaped = true;
+      continue;
+    }
+
+    if (ch === '"') {
+      quote = quote === 1 ? 0 : 1;
+      value += ch;
+      continue;
+    }
+
+    if (quote === 0) {
+      if (ch === '[') {
+        bracket++;
+      } else if (ch === ']' && bracket > 0) {
+        bracket--;
+      } else if (bracket === 0) {
+        if (ch === '(') {
+          paren++;
+        } else if (ch === ')' && paren > 0) {
+          paren--;
+        } else if (ch === '|' && paren === 0) {
+          parts.push(value);
+          value = '';
+          continue;
+        }
+      }
+    }
+
+    value += ch;
+  }
+
+  parts.push(value);
+  return parts;
+};
+
+const isPlainBranch = branch => {
+  let escaped = false;
+
+  for (const ch of branch) {
+    if (escaped === true) {
+      escaped = false;
+      continue;
+    }
+
+    if (ch === '\\') {
+      escaped = true;
+      continue;
+    }
+
+    if (/[?*+@!()[\]{}]/.test(ch)) {
+      return false;
+    }
+  }
+
+  return true;
+};
+
+const normalizeSimpleBranch = branch => {
+  let value = branch.trim();
+  let changed = true;
+
+  while (changed === true) {
+    changed = false;
+
+    if (/^@\([^\\()[\]{}|]+\)$/.test(value)) {
+      value = value.slice(2, -1);
+      changed = true;
+    }
+  }
+
+  if (!isPlainBranch(value)) {
+    return;
+  }
+
+  return value.replace(/\\(.)/g, '$1');
+};
+
+const hasRepeatedCharPrefixOverlap = branches => {
+  const values = branches.map(normalizeSimpleBranch).filter(Boolean);
+
+  for (let i = 0; i < values.length; i++) {
+    for (let j = i + 1; j < values.length; j++) {
+      const a = values[i];
+      const b = values[j];
+      const char = a[0];
+
+      if (!char || a !== char.repeat(a.length) || b !== char.repeat(b.length)) {
+        continue;
+      }
+
+      if (a === b || a.startsWith(b) || b.startsWith(a)) {
+        return true;
+      }
+    }
+  }
+
+  return false;
+};
+
+const parseRepeatedExtglob = (pattern, requireEnd = true) => {
+  if ((pattern[0] !== '+' && pattern[0] !== '*') || pattern[1] !== '(') {
+    return;
+  }
+
+  let bracket = 0;
+  let paren = 0;
+  let quote = 0;
+  let escaped = false;
+
+  for (let i = 1; i < pattern.length; i++) {
+    const ch = pattern[i];
+
+    if (escaped === true) {
+      escaped = false;
+      continue;
+    }
+
+    if (ch === '\\') {
+      escaped = true;
+      continue;
+    }
+
+    if (ch === '"') {
+      quote = quote === 1 ? 0 : 1;
+      continue;
+    }
+
+    if (quote === 1) {
+      continue;
+    }
+
+    if (ch === '[') {
+      bracket++;
+      continue;
+    }
+
+    if (ch === ']' && bracket > 0) {
+      bracket--;
+      continue;
+    }
+
+    if (bracket > 0) {
+      continue;
+    }
+
+    if (ch === '(') {
+      paren++;
+      continue;
+    }
+
+    if (ch === ')') {
+      paren--;
+
+      if (paren === 0) {
+        if (requireEnd === true && i !== pattern.length - 1) {
+          return;
+        }
+
+        return {
+          type: pattern[0],
+          body: pattern.slice(2, i),
+          end: i
+        };
+      }
+    }
+  }
+};
+
+const getStarExtglobSequenceOutput = pattern => {
+  let index = 0;
+  const chars = [];
+
+  while (index < pattern.length) {
+    const match = parseRepeatedExtglob(pattern.slice(index), false);
+
+    if (!match || match.type !== '*') {
+      return;
+    }
+
+    const branches = splitTopLevel(match.body).map(branch => branch.trim());
+    if (branches.length !== 1) {
+      return;
+    }
+
+    const branch = normalizeSimpleBranch(branches[0]);
+    if (!branch || branch.length !== 1) {
+      return;
+    }
+
+    chars.push(branch);
+    index += match.end + 1;
+  }
+
+  if (chars.length < 1) {
+    return;
+  }
+
+  const source = chars.length === 1
+    ? utils.escapeRegex(chars[0])
+    : `[${chars.map(ch => utils.escapeRegex(ch)).join('')}]`;
+
+  return `${source}*`;
+};
+
+const repeatedExtglobRecursion = pattern => {
+  let depth = 0;
+  let value = pattern.trim();
+  let match = parseRepeatedExtglob(value);
+
+  while (match) {
+    depth++;
+    value = match.body.trim();
+    match = parseRepeatedExtglob(value);
+  }
+
+  return depth;
+};
+
+const analyzeRepeatedExtglob = (body, options) => {
+  if (options.maxExtglobRecursion === false) {
+    return { risky: false };
+  }
+
+  const max =
+    typeof options.maxExtglobRecursion === 'number'
+      ? options.maxExtglobRecursion
+      : constants.DEFAULT_MAX_EXTGLOB_RECURSION;
+
+  const branches = splitTopLevel(body).map(branch => branch.trim());
+
+  if (branches.length > 1) {
+    if (
+      branches.some(branch => branch === '') ||
+      branches.some(branch => /^[*?]+$/.test(branch)) ||
+      hasRepeatedCharPrefixOverlap(branches)
+    ) {
+      return { risky: true };
+    }
+  }
+
+  for (const branch of branches) {
+    const safeOutput = getStarExtglobSequenceOutput(branch);
+    if (safeOutput) {
+      return { risky: true, safeOutput };
+    }
+
+    if (repeatedExtglobRecursion(branch) > max) {
+      return { risky: true };
+    }
+  }
+
+  return { risky: false };
 };
 
 /**
@@ -7493,6 +7876,8 @@ const parse = (input, options) => {
     token.prev = prev;
     token.parens = state.parens;
     token.output = state.output;
+    token.startIndex = state.index;
+    token.tokensIndex = tokens.length;
     const output = (opts.capture ? '(' : '') + token.open;
 
     increment('parens');
@@ -7502,6 +7887,34 @@ const parse = (input, options) => {
   };
 
   const extglobClose = token => {
+    const literal = input.slice(token.startIndex, state.index + 1);
+    const body = input.slice(token.startIndex + 2, state.index);
+    const analysis = analyzeRepeatedExtglob(body, opts);
+
+    if ((token.type === 'plus' || token.type === 'star') && analysis.risky) {
+      const safeOutput = analysis.safeOutput
+        ? (token.output ? '' : ONE_CHAR) + (opts.capture ? `(${analysis.safeOutput})` : analysis.safeOutput)
+        : undefined;
+      const open = tokens[token.tokensIndex];
+
+      open.type = 'text';
+      open.value = literal;
+      open.output = safeOutput || utils.escapeRegex(literal);
+
+      for (let i = token.tokensIndex + 1; i < tokens.length; i++) {
+        tokens[i].value = '';
+        tokens[i].output = '';
+        delete tokens[i].suffix;
+      }
+
+      state.output = token.output + open.output;
+      state.backtrack = true;
+
+      push({ type: 'paren', extglob: true, value, output: '' });
+      decrement('parens');
+      return;
+    }
+
     let output = token.close + (opts.capture ? ')' : '');
     let rest;
 
@@ -12965,6 +13378,24 @@ class SecureProxyConnectionError extends UndiciError {
   [kSecureProxyConnectionError] = true
 }
 
+const kMessageSizeExceededError = Symbol.for('undici.error.UND_ERR_WS_MESSAGE_SIZE_EXCEEDED')
+class MessageSizeExceededError extends UndiciError {
+  constructor (message) {
+    super(message)
+    this.name = 'MessageSizeExceededError'
+    this.message = message || 'Max decompressed message size exceeded'
+    this.code = 'UND_ERR_WS_MESSAGE_SIZE_EXCEEDED'
+  }
+
+  static [Symbol.hasInstance] (instance) {
+    return instance && instance[kMessageSizeExceededError] === true
+  }
+
+  get [kMessageSizeExceededError] () {
+    return true
+  }
+}
+
 module.exports = {
   AbortError,
   HTTPParserError,
@@ -12988,7 +13419,8 @@ module.exports = {
   ResponseExceededMaxSizeError,
   RequestRetryError,
   ResponseError,
-  SecureProxyConnectionError
+  SecureProxyConnectionError,
+  MessageSizeExceededError
 }
 
 
@@ -13063,6 +13495,10 @@ class Request {
 
     if (upgrade && typeof upgrade !== 'string') {
       throw new InvalidArgumentError('upgrade must be a string')
+    }
+
+    if (upgrade && !isValidHeaderValue(upgrade)) {
+      throw new InvalidArgumentError('invalid upgrade header')
     }
 
     if (headersTimeout != null && (!Number.isFinite(headersTimeout) || headersTimeout < 0)) {
@@ -13359,13 +13795,19 @@ function processHeader (request, key, val) {
     val = `${val}`
   }
 
-  if (request.host === null && headerName === 'host') {
+  if (headerName === 'host') {
+    if (request.host !== null) {
+      throw new InvalidArgumentError('duplicate host header')
+    }
     if (typeof val !== 'string') {
       throw new InvalidArgumentError('invalid host header')
     }
     // Consumed by Client
     request.host = val
-  } else if (request.contentLength === null && headerName === 'content-length') {
+  } else if (headerName === 'content-length') {
+    if (request.contentLength !== null) {
+      throw new InvalidArgumentError('duplicate content-length header')
+    }
     request.contentLength = parseInt(val, 10)
     if (!Number.isFinite(request.contentLength)) {
       throw new InvalidArgumentError('invalid content-length header')
@@ -36082,10 +36524,14 @@ module.exports = {
 
 const { createInflateRaw, Z_DEFAULT_WINDOWBITS } = __nccwpck_require__(8522)
 const { isValidClientWindowBits } = __nccwpck_require__(8625)
+const { MessageSizeExceededError } = __nccwpck_require__(8707)
 
 const tail = Buffer.from([0x00, 0x00, 0xff, 0xff])
 const kBuffer = Symbol('kBuffer')
 const kLength = Symbol('kLength')
+
+// Default maximum decompressed message size: 4 MB
+const kDefaultMaxDecompressedSize = 4 * 1024 * 1024
 
 class PerMessageDeflate {
   /** @type {import('node:zlib').InflateRaw} */
@@ -36093,6 +36539,15 @@ class PerMessageDeflate {
 
   #options = {}
 
+  /** @type {boolean} */
+  #aborted = false
+
+  /** @type {Function|null} */
+  #currentCallback = null
+
+  /**
+   * @param {Map<string, string>} extensions
+   */
   constructor (extensions) {
     this.#options.serverNoContextTakeover = extensions.has('server_no_context_takeover')
     this.#options.serverMaxWindowBits = extensions.get('server_max_window_bits')
@@ -36103,6 +36558,11 @@ class PerMessageDeflate {
     // 1.  Append 4 octets of 0x00 0x00 0xff 0xff to the tail end of the
     //     payload of the message.
     // 2.  Decompress the resulting data using DEFLATE.
+
+    if (this.#aborted) {
+      callback(new MessageSizeExceededError())
+      return
+    }
 
     if (!this.#inflate) {
       let windowBits = Z_DEFAULT_WINDOWBITS
@@ -36116,13 +36576,37 @@ class PerMessageDeflate {
         windowBits = Number.parseInt(this.#options.serverMaxWindowBits)
       }
 
-      this.#inflate = createInflateRaw({ windowBits })
+      try {
+        this.#inflate = createInflateRaw({ windowBits })
+      } catch (err) {
+        callback(err)
+        return
+      }
       this.#inflate[kBuffer] = []
       this.#inflate[kLength] = 0
 
       this.#inflate.on('data', (data) => {
-        this.#inflate[kBuffer].push(data)
+        if (this.#aborted) {
+          return
+        }
+
         this.#inflate[kLength] += data.length
+
+        if (this.#inflate[kLength] > kDefaultMaxDecompressedSize) {
+          this.#aborted = true
+          this.#inflate.removeAllListeners()
+          this.#inflate.destroy()
+          this.#inflate = null
+
+          if (this.#currentCallback) {
+            const cb = this.#currentCallback
+            this.#currentCallback = null
+            cb(new MessageSizeExceededError())
+          }
+          return
+        }
+
+        this.#inflate[kBuffer].push(data)
       })
 
       this.#inflate.on('error', (err) => {
@@ -36131,16 +36615,22 @@ class PerMessageDeflate {
       })
     }
 
+    this.#currentCallback = callback
     this.#inflate.write(chunk)
     if (fin) {
       this.#inflate.write(tail)
     }
 
     this.#inflate.flush(() => {
+      if (this.#aborted || !this.#inflate) {
+        return
+      }
+
       const full = Buffer.concat(this.#inflate[kBuffer], this.#inflate[kLength])
 
       this.#inflate[kBuffer].length = 0
       this.#inflate[kLength] = 0
+      this.#currentCallback = null
 
       callback(null, full)
     })
@@ -36194,6 +36684,10 @@ class ByteParser extends Writable {
   /** @type {Map<string, PerMessageDeflate>} */
   #extensions
 
+  /**
+   * @param {import('./websocket').WebSocket} ws
+   * @param {Map<string, string>|null} extensions
+   */
   constructor (ws, extensions) {
     super()
 
@@ -36336,6 +36830,7 @@ class ByteParser extends Writable {
 
         const buffer = this.consume(8)
         const upper = buffer.readUInt32BE(0)
+        const lower = buffer.readUInt32BE(4)
 
         // 2^31 is the maximum bytes an arraybuffer can contain
         // on 32-bit systems. Although, on 64-bit systems, this is
@@ -36343,14 +36838,12 @@ class ByteParser extends Writable {
         // https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Errors/Invalid_array_length
         // https://source.chromium.org/chromium/chromium/src/+/main:v8/src/common/globals.h;drc=1946212ac0100668f14eb9e2843bdd846e510a1e;bpv=1;bpt=1;l=1275
         // https://source.chromium.org/chromium/chromium/src/+/main:v8/src/objects/js-array-buffer.h;l=34;drc=1946212ac0100668f14eb9e2843bdd846e510a1e
-        if (upper > 2 ** 31 - 1) {
+        if (upper !== 0 || lower > 2 ** 31 - 1) {
           failWebsocketConnection(this.ws, 'Received payload length > 2^31 bytes.')
           return
         }
 
-        const lower = buffer.readUInt32BE(4)
-
-        this.#info.payloadLength = (upper << 8) + lower
+        this.#info.payloadLength = lower
         this.#state = parserStates.READ_DATA
       } else if (this.#state === parserStates.READ_DATA) {
         if (this.#byteOffset < this.#info.payloadLength) {
@@ -36380,7 +36873,7 @@ class ByteParser extends Writable {
           } else {
             this.#extensions.get('permessage-deflate').decompress(body, this.#info.fin, (error, data) => {
               if (error) {
-                closeWebSocketConnection(this.ws, 1007, error.message, error.message.length)
+                failWebsocketConnection(this.ws, error.message)
                 return
               }
 
@@ -36984,6 +37477,12 @@ function parseExtensions (extensions) {
  * @param {string} value
  */
 function isValidClientWindowBits (value) {
+  // Must have at least one character
+  if (value.length === 0) {
+    return false
+  }
+
+  // Check all characters are ASCII digits
   for (let i = 0; i < value.length; i++) {
     const byte = value.charCodeAt(i)
 
@@ -36992,7 +37491,9 @@ function isValidClientWindowBits (value) {
     }
   }
 
-  return true
+  // Check numeric range: zlib requires windowBits in range 8-15
+  const num = Number.parseInt(value, 10)
+  return num >= 8 && num <= 15
 }
 
 // https://nodejs.org/api/intl.html#detecting-internationalization-support
@@ -37470,7 +37971,7 @@ class WebSocket extends EventTarget {
    * @see https://websockets.spec.whatwg.org/#feedback-from-the-protocol
    */
   #onConnectionEstablished (response, parsedExtensions) {
-    // processResponse is called when the "response’s header list has been received and initialized."
+    // processResponse is called when the "response's header list has been received and initialized."
     // once this happens, the connection is open
     this[kResponse] = response
 
@@ -51491,18 +51992,101 @@ function slash(path) {
 
 
 
+
 const isNegativePattern = pattern => pattern[0] === '!';
 
 /**
-Normalize an absolute pattern to be relative.
+Normalize a root-anchored pattern to be relative.
 
 On Unix, patterns starting with `/` are interpreted as absolute paths from the filesystem root. This causes inconsistent behavior across platforms since Windows uses different path roots (like `C:\`).
 
-This function strips leading `/` to make patterns relative to cwd, ensuring consistent cross-platform behavior.
+This function strips leading `/` only for root-anchored glob patterns (e.g., `/**`, `/*.txt`, `/foo`), not for real absolute filesystem paths (e.g., `/Users/foo/bar`, `/home/user/project`).
+
+The heuristic: if the pattern has multiple path segments and the first segment contains no glob characters, it's treated as a real absolute path and left unchanged.
 
 @param {string} pattern - The pattern to normalize.
 */
-const normalizeAbsolutePatternToRelative = pattern => pattern.startsWith('/') ? pattern.slice(1) : pattern;
+const normalizeAbsolutePatternToRelative = pattern => {
+	if (!pattern.startsWith('/')) {
+		return pattern;
+	}
+
+	const inner = pattern.slice(1);
+	const firstSlashIndex = inner.indexOf('/');
+	const firstSegment = firstSlashIndex > 0 ? inner.slice(0, firstSlashIndex) : inner;
+
+	// Preserve real absolute paths (multi-segment, non-glob first component like /Users/foo/bar)
+	if (firstSlashIndex > 0 && !out.isDynamicPattern(firstSegment)) {
+		return pattern;
+	}
+
+	// Strip leading / from root-anchored globs (/**, /*.txt, /foo, /{src,dist}/**)
+	return inner;
+};
+
+const absolutePrefixesMatch = (positivePrefix, negativePrefix) => negativePrefix === positivePrefix;
+
+/**
+Get the leading static prefix from an absolute pattern.
+
+@param {string} pattern - The pattern to inspect.
+@returns {string|undefined} Static absolute prefix, for example `/tmp/project`.
+*/
+const getStaticAbsolutePathPrefix = pattern => {
+	if (!external_node_path_namespaceObject.isAbsolute(pattern)) {
+		return undefined;
+	}
+
+	const staticSegments = [];
+	for (const segment of pattern.split('/')) {
+		if (!segment) {
+			continue;
+		}
+
+		if (out.isDynamicPattern(segment)) {
+			break;
+		}
+
+		staticSegments.push(segment);
+	}
+
+	return staticSegments.length === 0 ? undefined : `/${staticSegments.join('/')}`;
+};
+
+/**
+Normalize a negative pattern while preserving true absolute paths when needed.
+
+@param {string} pattern - A negative pattern without the leading `!`.
+@param {string[]} [positiveAbsolutePathPrefixes] - Static prefixes from previous positive absolute patterns.
+@param {boolean} [hasRelativePositivePattern] - Whether a relative positive pattern has been seen before this negation.
+@returns {string} Normalized pattern.
+*/
+const normalizeNegativePattern = (pattern, positiveAbsolutePathPrefixes = [], hasRelativePositivePattern = false) => {
+	// Non-absolute patterns pass through unchanged.
+	if (!pattern.startsWith('/')) {
+		return pattern;
+	}
+
+	const normalizedPattern = normalizeAbsolutePatternToRelative(pattern);
+
+	// Dynamic root-anchored patterns (e.g. `/{src,dist}/**`) are always normalized to relative.
+	if (normalizedPattern !== pattern) {
+		return normalizedPattern;
+	}
+
+	// In mixed relative/absolute pattern sets, keep root-anchored literals cwd-relative.
+	if (hasRelativePositivePattern) {
+		return pattern.slice(1);
+	}
+
+	// Literal absolute patterns are treated as cwd-relative unless they clearly target
+	// the same absolute filesystem area as a positive absolute pattern seen so far.
+	const negativeAbsolutePathPrefix = getStaticAbsolutePathPrefix(pattern);
+	const preserveAsAbsolutePattern = negativeAbsolutePathPrefix !== undefined
+		&& positiveAbsolutePathPrefixes.some(positiveAbsolutePathPrefix => absolutePrefixesMatch(positiveAbsolutePathPrefix, negativeAbsolutePathPrefix));
+
+	return preserveAsAbsolutePattern ? pattern : pattern.slice(1);
+};
 
 const bindFsMethod = (object, methodName) => {
 	const method = object?.[methodName];
@@ -52410,9 +52994,28 @@ const convertNegativePatterns = (patterns, options) => {
 		patterns = ['**/*', ...patterns];
 	}
 
-	patterns = patterns.map(pattern => isNegativePattern(pattern)
-		? `!${normalizeAbsolutePatternToRelative(pattern.slice(1))}`
-		: pattern);
+	const positiveAbsolutePathPrefixes = [];
+	let hasRelativePositivePattern = false;
+	const normalizedPatterns = [];
+
+	for (const pattern of patterns) {
+		if (isNegativePattern(pattern)) {
+			normalizedPatterns.push(`!${normalizeNegativePattern(pattern.slice(1), positiveAbsolutePathPrefixes, hasRelativePositivePattern)}`);
+			continue;
+		}
+
+		normalizedPatterns.push(pattern);
+
+		const staticAbsolutePathPrefix = getStaticAbsolutePathPrefix(pattern);
+		if (staticAbsolutePathPrefix === undefined) {
+			hasRelativePositivePattern = true;
+			continue;
+		}
+
+		positiveAbsolutePathPrefixes.push(staticAbsolutePathPrefix);
+	}
+
+	patterns = normalizedPatterns;
 
 	const tasks = [];
 
@@ -52571,6 +53174,8 @@ const generateGlobTasksSync = normalizeArgumentsSync(generateTasksSync);
 
 const {convertPathToPattern} = out;
 
+// EXTERNAL MODULE: ./node_modules/jsonpointer/jsonpointer.js
+var jsonpointer = __nccwpck_require__(3976);
 // EXTERNAL MODULE: ./node_modules/micromatch/index.js
 var micromatch = __nccwpck_require__(8785);
 ;// CONCATENATED MODULE: ./node_modules/markdownlint/lib/node-imports-node.mjs
@@ -71046,6 +71651,11 @@ function stripAnsi(string) {
 		throw new TypeError(`Expected a \`string\`, got \`${typeof string}\``);
 	}
 
+	// Fast path: ANSI codes require ESC (7-bit) or CSI (8-bit) introducer
+	if (!string.includes('\u001B') && !string.includes('\u009B')) {
+		return string;
+	}
+
 	// Even though the regex is global, we don't need to reset the `.lastIndex`
 	// because unlike `.exec()` and `.test()`, `.replace()` does it automatically
 	// and doing it manually has a performance penalty.
@@ -73424,6 +74034,33 @@ const appendToArray = (destination, source) => {
 /* harmony default export */ const append_to_array = (appendToArray);
 
 
+;// CONCATENATED MODULE: ./node_modules/markdownlint-cli2/constants.mjs
+// @ts-check
+
+const packageName = "markdownlint-cli2";
+const packageVersion = "0.22.0";
+
+const libraryName = "markdownlint";
+
+const cli2SchemaKeys = new Set([
+  "config",
+  "customRules",
+  "fix",
+  "frontMatter",
+  "gitignore",
+  "globs",
+  "ignores",
+  "markdownItPlugins",
+  "modulePaths",
+  "noBanner",
+  "noInlineConfig",
+  "noProgress",
+  "outputFormatters",
+  "showFound"
+]);
+
+
+
 ;// CONCATENATED MODULE: ./node_modules/markdownlint-cli2/merge-options.mjs
 // @ts-check
 
@@ -73478,6 +74115,1144 @@ const jsoncParse = (text) => {
 };
 
 /* harmony default export */ const jsonc_parse = (jsoncParse);
+
+;// CONCATENATED MODULE: ./node_modules/smol-toml/dist/error.js
+/*!
+ * Copyright (c) Squirrel Chat et al., All rights reserved.
+ * SPDX-License-Identifier: BSD-3-Clause
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are met:
+ *
+ * 1. Redistributions of source code must retain the above copyright notice, this
+ *    list of conditions and the following disclaimer.
+ * 2. Redistributions in binary form must reproduce the above copyright notice,
+ *    this list of conditions and the following disclaimer in the
+ *    documentation and/or other materials provided with the distribution.
+ * 3. Neither the name of the copyright holder nor the names of its contributors
+ *    may be used to endorse or promote products derived from this software without
+ *    specific prior written permission.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
+ * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+ * WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+ * DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
+ * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+ * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+ * SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+ * CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+ * OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+ * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+ */
+function getLineColFromPtr(string, ptr) {
+    let lines = string.slice(0, ptr).split(/\r\n|\n|\r/g);
+    return [lines.length, lines.pop().length + 1];
+}
+function makeCodeBlock(string, line, column) {
+    let lines = string.split(/\r\n|\n|\r/g);
+    let codeblock = '';
+    let numberLen = (Math.log10(line + 1) | 0) + 1;
+    for (let i = line - 1; i <= line + 1; i++) {
+        let l = lines[i - 1];
+        if (!l)
+            continue;
+        codeblock += i.toString().padEnd(numberLen, ' ');
+        codeblock += ':  ';
+        codeblock += l;
+        codeblock += '\n';
+        if (i === line) {
+            codeblock += ' '.repeat(numberLen + column + 2);
+            codeblock += '^\n';
+        }
+    }
+    return codeblock;
+}
+class TomlError extends Error {
+    line;
+    column;
+    codeblock;
+    constructor(message, options) {
+        const [line, column] = getLineColFromPtr(options.toml, options.ptr);
+        const codeblock = makeCodeBlock(options.toml, line, column);
+        super(`Invalid TOML document: ${message}\n\n${codeblock}`, options);
+        this.line = line;
+        this.column = column;
+        this.codeblock = codeblock;
+    }
+}
+
+;// CONCATENATED MODULE: ./node_modules/smol-toml/dist/util.js
+/*!
+ * Copyright (c) Squirrel Chat et al., All rights reserved.
+ * SPDX-License-Identifier: BSD-3-Clause
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are met:
+ *
+ * 1. Redistributions of source code must retain the above copyright notice, this
+ *    list of conditions and the following disclaimer.
+ * 2. Redistributions in binary form must reproduce the above copyright notice,
+ *    this list of conditions and the following disclaimer in the
+ *    documentation and/or other materials provided with the distribution.
+ * 3. Neither the name of the copyright holder nor the names of its contributors
+ *    may be used to endorse or promote products derived from this software without
+ *    specific prior written permission.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
+ * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+ * WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+ * DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
+ * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+ * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+ * SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+ * CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+ * OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+ * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+ */
+
+function isEscaped(str, ptr) {
+    let i = 0;
+    while (str[ptr - ++i] === '\\')
+        ;
+    return --i && (i % 2);
+}
+function indexOfNewline(str, start = 0, end = str.length) {
+    let idx = str.indexOf('\n', start);
+    if (str[idx - 1] === '\r')
+        idx--;
+    return idx <= end ? idx : -1;
+}
+function skipComment(str, ptr) {
+    for (let i = ptr; i < str.length; i++) {
+        let c = str[i];
+        if (c === '\n')
+            return i;
+        if (c === '\r' && str[i + 1] === '\n')
+            return i + 1;
+        if ((c < '\x20' && c !== '\t') || c === '\x7f') {
+            throw new TomlError('control characters are not allowed in comments', {
+                toml: str,
+                ptr: ptr,
+            });
+        }
+    }
+    return str.length;
+}
+function skipVoid(str, ptr, banNewLines, banComments) {
+    let c;
+    while ((c = str[ptr]) === ' ' || c === '\t' || (!banNewLines && (c === '\n' || c === '\r' && str[ptr + 1] === '\n')))
+        ptr++;
+    return banComments || c !== '#'
+        ? ptr
+        : skipVoid(str, skipComment(str, ptr), banNewLines);
+}
+function skipUntil(str, ptr, sep, end, banNewLines = false) {
+    if (!end) {
+        ptr = indexOfNewline(str, ptr);
+        return ptr < 0 ? str.length : ptr;
+    }
+    for (let i = ptr; i < str.length; i++) {
+        let c = str[i];
+        if (c === '#') {
+            i = indexOfNewline(str, i);
+        }
+        else if (c === sep) {
+            return i + 1;
+        }
+        else if (c === end || (banNewLines && (c === '\n' || (c === '\r' && str[i + 1] === '\n')))) {
+            return i;
+        }
+    }
+    throw new TomlError('cannot find end of structure', {
+        toml: str,
+        ptr: ptr
+    });
+}
+function getStringEnd(str, seek) {
+    let first = str[seek];
+    let target = first === str[seek + 1] && str[seek + 1] === str[seek + 2]
+        ? str.slice(seek, seek + 3)
+        : first;
+    seek += target.length - 1;
+    do
+        seek = str.indexOf(target, ++seek);
+    while (seek > -1 && first !== "'" && isEscaped(str, seek));
+    if (seek > -1) {
+        seek += target.length;
+        if (target.length > 1) {
+            if (str[seek] === first)
+                seek++;
+            if (str[seek] === first)
+                seek++;
+        }
+    }
+    return seek;
+}
+
+;// CONCATENATED MODULE: ./node_modules/smol-toml/dist/date.js
+/*!
+ * Copyright (c) Squirrel Chat et al., All rights reserved.
+ * SPDX-License-Identifier: BSD-3-Clause
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are met:
+ *
+ * 1. Redistributions of source code must retain the above copyright notice, this
+ *    list of conditions and the following disclaimer.
+ * 2. Redistributions in binary form must reproduce the above copyright notice,
+ *    this list of conditions and the following disclaimer in the
+ *    documentation and/or other materials provided with the distribution.
+ * 3. Neither the name of the copyright holder nor the names of its contributors
+ *    may be used to endorse or promote products derived from this software without
+ *    specific prior written permission.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
+ * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+ * WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+ * DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
+ * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+ * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+ * SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+ * CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+ * OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+ * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+ */
+let DATE_TIME_RE = /^(\d{4}-\d{2}-\d{2})?[T ]?(?:(\d{2}):\d{2}(?::\d{2}(?:\.\d+)?)?)?(Z|[-+]\d{2}:\d{2})?$/i;
+class TomlDate extends Date {
+    #hasDate = false;
+    #hasTime = false;
+    #offset = null;
+    constructor(date) {
+        let hasDate = true;
+        let hasTime = true;
+        let offset = 'Z';
+        if (typeof date === 'string') {
+            let match = date.match(DATE_TIME_RE);
+            if (match) {
+                if (!match[1]) {
+                    hasDate = false;
+                    date = `0000-01-01T${date}`;
+                }
+                hasTime = !!match[2];
+                // Make sure to use T instead of a space. Breaks in case of extreme values otherwise.
+                hasTime && date[10] === ' ' && (date = date.replace(' ', 'T'));
+                // Do not allow rollover hours.
+                if (match[2] && +match[2] > 23) {
+                    date = '';
+                }
+                else {
+                    offset = match[3] || null;
+                    date = date.toUpperCase();
+                    if (!offset && hasTime)
+                        date += 'Z';
+                }
+            }
+            else {
+                date = '';
+            }
+        }
+        super(date);
+        if (!isNaN(this.getTime())) {
+            this.#hasDate = hasDate;
+            this.#hasTime = hasTime;
+            this.#offset = offset;
+        }
+    }
+    isDateTime() {
+        return this.#hasDate && this.#hasTime;
+    }
+    isLocal() {
+        return !this.#hasDate || !this.#hasTime || !this.#offset;
+    }
+    isDate() {
+        return this.#hasDate && !this.#hasTime;
+    }
+    isTime() {
+        return this.#hasTime && !this.#hasDate;
+    }
+    isValid() {
+        return this.#hasDate || this.#hasTime;
+    }
+    toISOString() {
+        let iso = super.toISOString();
+        // Local Date
+        if (this.isDate())
+            return iso.slice(0, 10);
+        // Local Time
+        if (this.isTime())
+            return iso.slice(11, 23);
+        // Local DateTime
+        if (this.#offset === null)
+            return iso.slice(0, -1);
+        // Offset DateTime
+        if (this.#offset === 'Z')
+            return iso;
+        // This part is quite annoying: JS strips the original timezone from the ISO string representation
+        // Instead of using a "modified" date and "Z", we restore the representation "as authored"
+        let offset = (+(this.#offset.slice(1, 3)) * 60) + +(this.#offset.slice(4, 6));
+        offset = this.#offset[0] === '-' ? offset : -offset;
+        let offsetDate = new Date(this.getTime() - (offset * 60e3));
+        return offsetDate.toISOString().slice(0, -1) + this.#offset;
+    }
+    static wrapAsOffsetDateTime(jsDate, offset = 'Z') {
+        let date = new TomlDate(jsDate);
+        date.#offset = offset;
+        return date;
+    }
+    static wrapAsLocalDateTime(jsDate) {
+        let date = new TomlDate(jsDate);
+        date.#offset = null;
+        return date;
+    }
+    static wrapAsLocalDate(jsDate) {
+        let date = new TomlDate(jsDate);
+        date.#hasTime = false;
+        date.#offset = null;
+        return date;
+    }
+    static wrapAsLocalTime(jsDate) {
+        let date = new TomlDate(jsDate);
+        date.#hasDate = false;
+        date.#offset = null;
+        return date;
+    }
+}
+
+;// CONCATENATED MODULE: ./node_modules/smol-toml/dist/primitive.js
+/*!
+ * Copyright (c) Squirrel Chat et al., All rights reserved.
+ * SPDX-License-Identifier: BSD-3-Clause
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are met:
+ *
+ * 1. Redistributions of source code must retain the above copyright notice, this
+ *    list of conditions and the following disclaimer.
+ * 2. Redistributions in binary form must reproduce the above copyright notice,
+ *    this list of conditions and the following disclaimer in the
+ *    documentation and/or other materials provided with the distribution.
+ * 3. Neither the name of the copyright holder nor the names of its contributors
+ *    may be used to endorse or promote products derived from this software without
+ *    specific prior written permission.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
+ * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+ * WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+ * DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
+ * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+ * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+ * SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+ * CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+ * OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+ * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+ */
+
+
+
+let INT_REGEX = /^((0x[0-9a-fA-F](_?[0-9a-fA-F])*)|(([+-]|0[ob])?\d(_?\d)*))$/;
+let FLOAT_REGEX = /^[+-]?\d(_?\d)*(\.\d(_?\d)*)?([eE][+-]?\d(_?\d)*)?$/;
+let LEADING_ZERO = /^[+-]?0[0-9_]/;
+let ESCAPE_REGEX = /^[0-9a-f]{2,8}$/i;
+let ESC_MAP = {
+    b: '\b',
+    t: '\t',
+    n: '\n',
+    f: '\f',
+    r: '\r',
+    e: '\x1b',
+    '"': '"',
+    '\\': '\\',
+};
+function parseString(str, ptr = 0, endPtr = str.length) {
+    let isLiteral = str[ptr] === '\'';
+    let isMultiline = str[ptr++] === str[ptr] && str[ptr] === str[ptr + 1];
+    if (isMultiline) {
+        endPtr -= 2;
+        if (str[ptr += 2] === '\r')
+            ptr++;
+        if (str[ptr] === '\n')
+            ptr++;
+    }
+    let tmp = 0;
+    let isEscape;
+    let parsed = '';
+    let sliceStart = ptr;
+    while (ptr < endPtr - 1) {
+        let c = str[ptr++];
+        if (c === '\n' || (c === '\r' && str[ptr] === '\n')) {
+            if (!isMultiline) {
+                throw new TomlError('newlines are not allowed in strings', {
+                    toml: str,
+                    ptr: ptr - 1,
+                });
+            }
+        }
+        else if ((c < '\x20' && c !== '\t') || c === '\x7f') {
+            throw new TomlError('control characters are not allowed in strings', {
+                toml: str,
+                ptr: ptr - 1,
+            });
+        }
+        if (isEscape) {
+            isEscape = false;
+            if (c === 'x' || c === 'u' || c === 'U') {
+                // Unicode escape
+                let code = str.slice(ptr, (ptr += (c === 'x' ? 2 : c === 'u' ? 4 : 8)));
+                if (!ESCAPE_REGEX.test(code)) {
+                    throw new TomlError('invalid unicode escape', {
+                        toml: str,
+                        ptr: tmp,
+                    });
+                }
+                try {
+                    parsed += String.fromCodePoint(parseInt(code, 16));
+                }
+                catch {
+                    throw new TomlError('invalid unicode escape', {
+                        toml: str,
+                        ptr: tmp,
+                    });
+                }
+            }
+            else if (isMultiline && (c === '\n' || c === ' ' || c === '\t' || c === '\r')) {
+                // Multiline escape
+                ptr = skipVoid(str, ptr - 1, true);
+                if (str[ptr] !== '\n' && str[ptr] !== '\r') {
+                    throw new TomlError('invalid escape: only line-ending whitespace may be escaped', {
+                        toml: str,
+                        ptr: tmp,
+                    });
+                }
+                ptr = skipVoid(str, ptr);
+            }
+            else if (c in ESC_MAP) {
+                // Classic escape
+                parsed += ESC_MAP[c];
+            }
+            else {
+                throw new TomlError('unrecognized escape sequence', {
+                    toml: str,
+                    ptr: tmp,
+                });
+            }
+            sliceStart = ptr;
+        }
+        else if (!isLiteral && c === '\\') {
+            tmp = ptr - 1;
+            isEscape = true;
+            parsed += str.slice(sliceStart, tmp);
+        }
+    }
+    return parsed + str.slice(sliceStart, endPtr - 1);
+}
+function parseValue(value, toml, ptr, integersAsBigInt) {
+    // Constant values
+    if (value === 'true')
+        return true;
+    if (value === 'false')
+        return false;
+    if (value === '-inf')
+        return -Infinity;
+    if (value === 'inf' || value === '+inf')
+        return Infinity;
+    if (value === 'nan' || value === '+nan' || value === '-nan')
+        return NaN;
+    // Avoid FP representation of -0
+    if (value === '-0')
+        return integersAsBigInt ? 0n : 0;
+    // Numbers
+    let isInt = INT_REGEX.test(value);
+    if (isInt || FLOAT_REGEX.test(value)) {
+        if (LEADING_ZERO.test(value)) {
+            throw new TomlError('leading zeroes are not allowed', {
+                toml: toml,
+                ptr: ptr,
+            });
+        }
+        value = value.replace(/_/g, '');
+        let numeric = +value;
+        if (isNaN(numeric)) {
+            throw new TomlError('invalid number', {
+                toml: toml,
+                ptr: ptr,
+            });
+        }
+        if (isInt) {
+            if ((isInt = !Number.isSafeInteger(numeric)) && !integersAsBigInt) {
+                throw new TomlError('integer value cannot be represented losslessly', {
+                    toml: toml,
+                    ptr: ptr,
+                });
+            }
+            if (isInt || integersAsBigInt === true)
+                numeric = BigInt(value);
+        }
+        return numeric;
+    }
+    const date = new TomlDate(value);
+    if (!date.isValid()) {
+        throw new TomlError('invalid value', {
+            toml: toml,
+            ptr: ptr,
+        });
+    }
+    return date;
+}
+
+;// CONCATENATED MODULE: ./node_modules/smol-toml/dist/extract.js
+/*!
+ * Copyright (c) Squirrel Chat et al., All rights reserved.
+ * SPDX-License-Identifier: BSD-3-Clause
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are met:
+ *
+ * 1. Redistributions of source code must retain the above copyright notice, this
+ *    list of conditions and the following disclaimer.
+ * 2. Redistributions in binary form must reproduce the above copyright notice,
+ *    this list of conditions and the following disclaimer in the
+ *    documentation and/or other materials provided with the distribution.
+ * 3. Neither the name of the copyright holder nor the names of its contributors
+ *    may be used to endorse or promote products derived from this software without
+ *    specific prior written permission.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
+ * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+ * WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+ * DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
+ * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+ * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+ * SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+ * CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+ * OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+ * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+ */
+
+
+
+
+function sliceAndTrimEndOf(str, startPtr, endPtr) {
+    let value = str.slice(startPtr, endPtr);
+    let commentIdx = value.indexOf('#');
+    if (commentIdx > -1) {
+        // The call to skipComment allows to "validate" the comment
+        // (absence of control characters)
+        skipComment(str, commentIdx);
+        value = value.slice(0, commentIdx);
+    }
+    return [value.trimEnd(), commentIdx];
+}
+function extractValue(str, ptr, end, depth, integersAsBigInt) {
+    if (depth === 0) {
+        throw new TomlError('document contains excessively nested structures. aborting.', {
+            toml: str,
+            ptr: ptr
+        });
+    }
+    let c = str[ptr];
+    if (c === '[' || c === '{') {
+        let [value, endPtr] = c === '['
+            ? parseArray(str, ptr, depth, integersAsBigInt)
+            : parseInlineTable(str, ptr, depth, integersAsBigInt);
+        if (end) {
+            endPtr = skipVoid(str, endPtr);
+            if (str[endPtr] === ',')
+                endPtr++;
+            else if (str[endPtr] !== end) {
+                throw new TomlError('expected comma or end of structure', {
+                    toml: str,
+                    ptr: endPtr,
+                });
+            }
+        }
+        return [value, endPtr];
+    }
+    let endPtr;
+    if (c === '"' || c === "'") {
+        endPtr = getStringEnd(str, ptr);
+        let parsed = parseString(str, ptr, endPtr);
+        if (end) {
+            endPtr = skipVoid(str, endPtr);
+            if (str[endPtr] && str[endPtr] !== ',' && str[endPtr] !== end && str[endPtr] !== '\n' && str[endPtr] !== '\r') {
+                throw new TomlError('unexpected character encountered', {
+                    toml: str,
+                    ptr: endPtr,
+                });
+            }
+            endPtr += (+(str[endPtr] === ','));
+        }
+        return [parsed, endPtr];
+    }
+    endPtr = skipUntil(str, ptr, ',', end);
+    let slice = sliceAndTrimEndOf(str, ptr, endPtr - (+(str[endPtr - 1] === ',')));
+    if (!slice[0]) {
+        throw new TomlError('incomplete key-value declaration: no value specified', {
+            toml: str,
+            ptr: ptr
+        });
+    }
+    if (end && slice[1] > -1) {
+        endPtr = skipVoid(str, ptr + slice[1]);
+        endPtr += +(str[endPtr] === ',');
+    }
+    return [
+        parseValue(slice[0], str, ptr, integersAsBigInt),
+        endPtr,
+    ];
+}
+
+;// CONCATENATED MODULE: ./node_modules/smol-toml/dist/struct.js
+/*!
+ * Copyright (c) Squirrel Chat et al., All rights reserved.
+ * SPDX-License-Identifier: BSD-3-Clause
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are met:
+ *
+ * 1. Redistributions of source code must retain the above copyright notice, this
+ *    list of conditions and the following disclaimer.
+ * 2. Redistributions in binary form must reproduce the above copyright notice,
+ *    this list of conditions and the following disclaimer in the
+ *    documentation and/or other materials provided with the distribution.
+ * 3. Neither the name of the copyright holder nor the names of its contributors
+ *    may be used to endorse or promote products derived from this software without
+ *    specific prior written permission.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
+ * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+ * WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+ * DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
+ * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+ * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+ * SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+ * CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+ * OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+ * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+ */
+
+
+
+
+let KEY_PART_RE = /^[a-zA-Z0-9-_]+[ \t]*$/;
+function parseKey(str, ptr, end = '=') {
+    let dot = ptr - 1;
+    let parsed = [];
+    let endPtr = str.indexOf(end, ptr);
+    if (endPtr < 0) {
+        throw new TomlError('incomplete key-value: cannot find end of key', {
+            toml: str,
+            ptr: ptr,
+        });
+    }
+    do {
+        let c = str[ptr = ++dot];
+        // If it's whitespace, ignore
+        if (c !== ' ' && c !== '\t') {
+            // If it's a string
+            if (c === '"' || c === '\'') {
+                if (c === str[ptr + 1] && c === str[ptr + 2]) {
+                    throw new TomlError('multiline strings are not allowed in keys', {
+                        toml: str,
+                        ptr: ptr,
+                    });
+                }
+                let eos = getStringEnd(str, ptr);
+                if (eos < 0) {
+                    throw new TomlError('unfinished string encountered', {
+                        toml: str,
+                        ptr: ptr,
+                    });
+                }
+                dot = str.indexOf('.', eos);
+                let strEnd = str.slice(eos, dot < 0 || dot > endPtr ? endPtr : dot);
+                let newLine = indexOfNewline(strEnd);
+                if (newLine > -1) {
+                    throw new TomlError('newlines are not allowed in keys', {
+                        toml: str,
+                        ptr: ptr + dot + newLine,
+                    });
+                }
+                if (strEnd.trimStart()) {
+                    throw new TomlError('found extra tokens after the string part', {
+                        toml: str,
+                        ptr: eos,
+                    });
+                }
+                if (endPtr < eos) {
+                    endPtr = str.indexOf(end, eos);
+                    if (endPtr < 0) {
+                        throw new TomlError('incomplete key-value: cannot find end of key', {
+                            toml: str,
+                            ptr: ptr,
+                        });
+                    }
+                }
+                parsed.push(parseString(str, ptr, eos));
+            }
+            else {
+                // Normal raw key part consumption and validation
+                dot = str.indexOf('.', ptr);
+                let part = str.slice(ptr, dot < 0 || dot > endPtr ? endPtr : dot);
+                if (!KEY_PART_RE.test(part)) {
+                    throw new TomlError('only letter, numbers, dashes and underscores are allowed in keys', {
+                        toml: str,
+                        ptr: ptr,
+                    });
+                }
+                parsed.push(part.trimEnd());
+            }
+        }
+        // Until there's no more dot
+    } while (dot + 1 && dot < endPtr);
+    return [parsed, skipVoid(str, endPtr + 1, true, true)];
+}
+function parseInlineTable(str, ptr, depth, integersAsBigInt) {
+    let res = {};
+    let seen = new Set();
+    let c;
+    ptr++;
+    while ((c = str[ptr++]) !== '}' && c) {
+        if (c === ',') {
+            throw new TomlError('expected value, found comma', {
+                toml: str,
+                ptr: ptr - 1,
+            });
+        }
+        else if (c === '#')
+            ptr = skipComment(str, ptr);
+        else if (c !== ' ' && c !== '\t' && c !== '\n' && c !== '\r') {
+            let k;
+            let t = res;
+            let hasOwn = false;
+            let [key, keyEndPtr] = parseKey(str, ptr - 1);
+            for (let i = 0; i < key.length; i++) {
+                if (i)
+                    t = hasOwn ? t[k] : (t[k] = {});
+                k = key[i];
+                if ((hasOwn = Object.hasOwn(t, k)) && (typeof t[k] !== 'object' || seen.has(t[k]))) {
+                    throw new TomlError('trying to redefine an already defined value', {
+                        toml: str,
+                        ptr: ptr,
+                    });
+                }
+                if (!hasOwn && k === '__proto__') {
+                    Object.defineProperty(t, k, { enumerable: true, configurable: true, writable: true });
+                }
+            }
+            if (hasOwn) {
+                throw new TomlError('trying to redefine an already defined value', {
+                    toml: str,
+                    ptr: ptr,
+                });
+            }
+            let [value, valueEndPtr] = extractValue(str, keyEndPtr, '}', depth - 1, integersAsBigInt);
+            seen.add(value);
+            t[k] = value;
+            ptr = valueEndPtr;
+        }
+    }
+    if (!c) {
+        throw new TomlError('unfinished table encountered', {
+            toml: str,
+            ptr: ptr,
+        });
+    }
+    return [res, ptr];
+}
+function parseArray(str, ptr, depth, integersAsBigInt) {
+    let res = [];
+    let c;
+    ptr++;
+    while ((c = str[ptr++]) !== ']' && c) {
+        if (c === ',') {
+            throw new TomlError('expected value, found comma', {
+                toml: str,
+                ptr: ptr - 1,
+            });
+        }
+        else if (c === '#')
+            ptr = skipComment(str, ptr);
+        else if (c !== ' ' && c !== '\t' && c !== '\n' && c !== '\r') {
+            let e = extractValue(str, ptr - 1, ']', depth - 1, integersAsBigInt);
+            res.push(e[0]);
+            ptr = e[1];
+        }
+    }
+    if (!c) {
+        throw new TomlError('unfinished array encountered', {
+            toml: str,
+            ptr: ptr,
+        });
+    }
+    return [res, ptr];
+}
+
+;// CONCATENATED MODULE: ./node_modules/smol-toml/dist/parse.js
+/*!
+ * Copyright (c) Squirrel Chat et al., All rights reserved.
+ * SPDX-License-Identifier: BSD-3-Clause
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are met:
+ *
+ * 1. Redistributions of source code must retain the above copyright notice, this
+ *    list of conditions and the following disclaimer.
+ * 2. Redistributions in binary form must reproduce the above copyright notice,
+ *    this list of conditions and the following disclaimer in the
+ *    documentation and/or other materials provided with the distribution.
+ * 3. Neither the name of the copyright holder nor the names of its contributors
+ *    may be used to endorse or promote products derived from this software without
+ *    specific prior written permission.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
+ * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+ * WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+ * DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
+ * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+ * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+ * SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+ * CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+ * OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+ * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+ */
+
+
+
+
+function peekTable(key, table, meta, type) {
+    let t = table;
+    let m = meta;
+    let k;
+    let hasOwn = false;
+    let state;
+    for (let i = 0; i < key.length; i++) {
+        if (i) {
+            t = hasOwn ? t[k] : (t[k] = {});
+            m = (state = m[k]).c;
+            if (type === 0 /* Type.DOTTED */ && (state.t === 1 /* Type.EXPLICIT */ || state.t === 2 /* Type.ARRAY */)) {
+                return null;
+            }
+            if (state.t === 2 /* Type.ARRAY */) {
+                let l = t.length - 1;
+                t = t[l];
+                m = m[l].c;
+            }
+        }
+        k = key[i];
+        if ((hasOwn = Object.hasOwn(t, k)) && m[k]?.t === 0 /* Type.DOTTED */ && m[k]?.d) {
+            return null;
+        }
+        if (!hasOwn) {
+            if (k === '__proto__') {
+                Object.defineProperty(t, k, { enumerable: true, configurable: true, writable: true });
+                Object.defineProperty(m, k, { enumerable: true, configurable: true, writable: true });
+            }
+            m[k] = {
+                t: i < key.length - 1 && type === 2 /* Type.ARRAY */
+                    ? 3 /* Type.ARRAY_DOTTED */
+                    : type,
+                d: false,
+                i: 0,
+                c: {},
+            };
+        }
+    }
+    state = m[k];
+    if (state.t !== type && !(type === 1 /* Type.EXPLICIT */ && state.t === 3 /* Type.ARRAY_DOTTED */)) {
+        // Bad key type!
+        return null;
+    }
+    if (type === 2 /* Type.ARRAY */) {
+        if (!state.d) {
+            state.d = true;
+            t[k] = [];
+        }
+        t[k].push(t = {});
+        state.c[state.i++] = (state = { t: 1 /* Type.EXPLICIT */, d: false, i: 0, c: {} });
+    }
+    if (state.d) {
+        // Redefining a table!
+        return null;
+    }
+    state.d = true;
+    if (type === 1 /* Type.EXPLICIT */) {
+        t = hasOwn ? t[k] : (t[k] = {});
+    }
+    else if (type === 0 /* Type.DOTTED */ && hasOwn) {
+        return null;
+    }
+    return [k, t, state.c];
+}
+function parse_parse(toml, { maxDepth = 1000, integersAsBigInt } = {}) {
+    let res = {};
+    let meta = {};
+    let tbl = res;
+    let m = meta;
+    for (let ptr = skipVoid(toml, 0); ptr < toml.length;) {
+        if (toml[ptr] === '[') {
+            let isTableArray = toml[++ptr] === '[';
+            let k = parseKey(toml, ptr += +isTableArray, ']');
+            if (isTableArray) {
+                if (toml[k[1] - 1] !== ']') {
+                    throw new TomlError('expected end of table declaration', {
+                        toml: toml,
+                        ptr: k[1] - 1,
+                    });
+                }
+                k[1]++;
+            }
+            let p = peekTable(k[0], res, meta, isTableArray ? 2 /* Type.ARRAY */ : 1 /* Type.EXPLICIT */);
+            if (!p) {
+                throw new TomlError('trying to redefine an already defined table or value', {
+                    toml: toml,
+                    ptr: ptr,
+                });
+            }
+            m = p[2];
+            tbl = p[1];
+            ptr = k[1];
+        }
+        else {
+            let k = parseKey(toml, ptr);
+            let p = peekTable(k[0], tbl, m, 0 /* Type.DOTTED */);
+            if (!p) {
+                throw new TomlError('trying to redefine an already defined table or value', {
+                    toml: toml,
+                    ptr: ptr,
+                });
+            }
+            let v = extractValue(toml, k[1], void 0, maxDepth, integersAsBigInt);
+            p[1][p[0]] = v[0];
+            ptr = v[1];
+        }
+        ptr = skipVoid(toml, ptr, true);
+        if (toml[ptr] && toml[ptr] !== '\n' && toml[ptr] !== '\r') {
+            throw new TomlError('each key-value declaration must be followed by an end-of-line', {
+                toml: toml,
+                ptr: ptr
+            });
+        }
+        ptr = skipVoid(toml, ptr);
+    }
+    return res;
+}
+
+;// CONCATENATED MODULE: ./node_modules/smol-toml/dist/stringify.js
+/*!
+ * Copyright (c) Squirrel Chat et al., All rights reserved.
+ * SPDX-License-Identifier: BSD-3-Clause
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are met:
+ *
+ * 1. Redistributions of source code must retain the above copyright notice, this
+ *    list of conditions and the following disclaimer.
+ * 2. Redistributions in binary form must reproduce the above copyright notice,
+ *    this list of conditions and the following disclaimer in the
+ *    documentation and/or other materials provided with the distribution.
+ * 3. Neither the name of the copyright holder nor the names of its contributors
+ *    may be used to endorse or promote products derived from this software without
+ *    specific prior written permission.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
+ * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+ * WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+ * DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
+ * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+ * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+ * SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+ * CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+ * OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+ * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+ */
+let BARE_KEY = /^[a-z0-9-_]+$/i;
+function extendedTypeOf(obj) {
+    let type = typeof obj;
+    if (type === 'object') {
+        if (Array.isArray(obj))
+            return 'array';
+        if (obj instanceof Date)
+            return 'date';
+    }
+    return type;
+}
+function isArrayOfTables(obj) {
+    for (let i = 0; i < obj.length; i++) {
+        if (extendedTypeOf(obj[i]) !== 'object')
+            return false;
+    }
+    return obj.length != 0;
+}
+function formatString(s) {
+    return JSON.stringify(s).replace(/\x7f/g, '\\u007f');
+}
+function stringifyValue(val, type, depth, numberAsFloat) {
+    if (depth === 0) {
+        throw new Error('Could not stringify the object: maximum object depth exceeded');
+    }
+    if (type === 'number') {
+        if (isNaN(val))
+            return 'nan';
+        if (val === Infinity)
+            return 'inf';
+        if (val === -Infinity)
+            return '-inf';
+        if (numberAsFloat && Number.isInteger(val))
+            return val.toFixed(1);
+        return val.toString();
+    }
+    if (type === 'bigint' || type === 'boolean') {
+        return val.toString();
+    }
+    if (type === 'string') {
+        return formatString(val);
+    }
+    if (type === 'date') {
+        if (isNaN(val.getTime())) {
+            throw new TypeError('cannot serialize invalid date');
+        }
+        return val.toISOString();
+    }
+    if (type === 'object') {
+        return stringifyInlineTable(val, depth, numberAsFloat);
+    }
+    if (type === 'array') {
+        return stringifyArray(val, depth, numberAsFloat);
+    }
+}
+function stringifyInlineTable(obj, depth, numberAsFloat) {
+    let keys = Object.keys(obj);
+    if (keys.length === 0)
+        return '{}';
+    let res = '{ ';
+    for (let i = 0; i < keys.length; i++) {
+        let k = keys[i];
+        if (i)
+            res += ', ';
+        res += BARE_KEY.test(k) ? k : formatString(k);
+        res += ' = ';
+        res += stringifyValue(obj[k], extendedTypeOf(obj[k]), depth - 1, numberAsFloat);
+    }
+    return res + ' }';
+}
+function stringifyArray(array, depth, numberAsFloat) {
+    if (array.length === 0)
+        return '[]';
+    let res = '[ ';
+    for (let i = 0; i < array.length; i++) {
+        if (i)
+            res += ', ';
+        if (array[i] === null || array[i] === void 0) {
+            throw new TypeError('arrays cannot contain null or undefined values');
+        }
+        res += stringifyValue(array[i], extendedTypeOf(array[i]), depth - 1, numberAsFloat);
+    }
+    return res + ' ]';
+}
+function stringifyArrayTable(array, key, depth, numberAsFloat) {
+    if (depth === 0) {
+        throw new Error('Could not stringify the object: maximum object depth exceeded');
+    }
+    let res = '';
+    for (let i = 0; i < array.length; i++) {
+        res += `${res && '\n'}[[${key}]]\n`;
+        res += stringifyTable(0, array[i], key, depth, numberAsFloat);
+    }
+    return res;
+}
+function stringifyTable(tableKey, obj, prefix, depth, numberAsFloat) {
+    if (depth === 0) {
+        throw new Error('Could not stringify the object: maximum object depth exceeded');
+    }
+    let preamble = '';
+    let tables = '';
+    let keys = Object.keys(obj);
+    for (let i = 0; i < keys.length; i++) {
+        let k = keys[i];
+        if (obj[k] !== null && obj[k] !== void 0) {
+            let type = extendedTypeOf(obj[k]);
+            if (type === 'symbol' || type === 'function') {
+                throw new TypeError(`cannot serialize values of type '${type}'`);
+            }
+            let key = BARE_KEY.test(k) ? k : formatString(k);
+            if (type === 'array' && isArrayOfTables(obj[k])) {
+                tables += (tables && '\n') + stringifyArrayTable(obj[k], prefix ? `${prefix}.${key}` : key, depth - 1, numberAsFloat);
+            }
+            else if (type === 'object') {
+                let tblKey = prefix ? `${prefix}.${key}` : key;
+                tables += (tables && '\n') + stringifyTable(tblKey, obj[k], tblKey, depth - 1, numberAsFloat);
+            }
+            else {
+                preamble += key;
+                preamble += ' = ';
+                preamble += stringifyValue(obj[k], type, depth, numberAsFloat);
+                preamble += '\n';
+            }
+        }
+    }
+    if (tableKey && (preamble || !tables)) // Create table only if necessary
+        preamble = preamble ? `[${tableKey}]\n${preamble}` : `[${tableKey}]`;
+    return preamble && tables
+        ? `${preamble}\n${tables}`
+        : preamble || tables;
+}
+function stringify(obj, { maxDepth = 1000, numbersAsFloat = false } = {}) {
+    if (extendedTypeOf(obj) !== 'object') {
+        throw new TypeError('stringify can only be called with an object');
+    }
+    let str = stringifyTable(0, obj, '', maxDepth, numbersAsFloat);
+    if (str[str.length - 1] !== '\n')
+        return str + '\n';
+    return str;
+}
+
+;// CONCATENATED MODULE: ./node_modules/smol-toml/dist/index.js
+/*!
+ * Copyright (c) Squirrel Chat et al., All rights reserved.
+ * SPDX-License-Identifier: BSD-3-Clause
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are met:
+ *
+ * 1. Redistributions of source code must retain the above copyright notice, this
+ *    list of conditions and the following disclaimer.
+ * 2. Redistributions in binary form must reproduce the above copyright notice,
+ *    this list of conditions and the following disclaimer in the
+ *    documentation and/or other materials provided with the distribution.
+ * 3. Neither the name of the copyright holder nor the names of its contributors
+ *    may be used to endorse or promote products derived from this software without
+ *    specific prior written permission.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
+ * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+ * WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+ * DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
+ * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+ * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+ * SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+ * CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+ * OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+ * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+ */
+
+
+
+
+/* harmony default export */ const dist = ({ parse: parse_parse, stringify: stringify, TomlDate: TomlDate, TomlError: TomlError });
+
+
+;// CONCATENATED MODULE: ./node_modules/markdownlint-cli2/parsers/toml-parse.mjs
+// @ts-check
+
+
+
+/**
+ * Parses a TOML string, returning the corresponding object.
+ * @type {import("markdownlint").ConfigurationParser}
+ */
+const tomlParse = (text) => parse_parse(text);
+
+/* harmony default export */ const toml_parse = (tomlParse);
 
 ;// CONCATENATED MODULE: ./node_modules/js-yaml/dist/js-yaml.mjs
 
@@ -77361,12 +79136,14 @@ const yamlParse = (text) => {
 
 
 
+
 /**
  * Array of parser objects ordered by priority.
  * @type {import("markdownlint").ConfigurationParser[]}
  */
 const parsers = [
   jsonc_parse,
+  toml_parse,
   yaml_parse
 ];
 
@@ -77392,12 +79169,12 @@ const pathPosix = external_node_path_namespaceObject.posix;
 
 
 
+
+
+
 /* eslint-disable jsdoc/reject-any-type */
 
 // Variables
-const packageName = "markdownlint-cli2";
-const packageVersion = "0.21.0";
-const libraryName = "markdownlint";
 const libraryVersion = getVersion();
 const bannerMessage = `${packageName} v${packageVersion} (${libraryName} v${libraryVersion})`;
 const dotOnlySubstitute = "*.{md,markdown}";
@@ -77408,6 +79185,15 @@ const markdownlint_cli2_noop = () => null;
 
 // Negates a glob
 const negateGlob = (/** @type {string} */ glob) => `!${glob}`;
+
+// Reads and parses a JSONC file
+const readJsonc = (/** @type {string} */ file, /** @type {FsLike} */ fs) => fs.promises.readFile(file, utf8).then(jsonc_parse);
+
+// Reads and parses a TOML file
+const readToml = (/** @type {string} */ file, /** @type {FsLike} */ fs) => fs.promises.readFile(file, utf8).then(toml_parse);
+
+// Reads and parses a YAML file
+const readYaml = (/** @type {string} */ file, /** @type {FsLike} */ fs) => fs.promises.readFile(file, utf8).then(yaml_parse);
 
 // Throws a meaningful exception for an unusable configuration file
 const throwForConfigurationFile = (/** @type {string} */ file, /** @type {Error | any} */ error) => {
@@ -77480,12 +79266,13 @@ const importModuleIdsAndParams = (/** @type {string[]} */ dirs, /** @type {strin
 );
 
 // Extend a config object if it has 'extends' property
-const getExtendedConfig = (/** @type {Configuration} */ config, /** @type {string} */ configPath, /** @type {FsLike} */ fs) => {
+const getExtendedConfig = (/** @type {ExecutionContext} */ context, /** @type {Configuration} */ config, /** @type {string} */ configPath) => {
   if (config.extends) {
+    const { fs, parsers } = context;
     return extendConfigPromise(
       config,
       configPath,
-      parsers_parsers,
+      parsers,
       fs
     );
   }
@@ -77494,50 +79281,64 @@ const getExtendedConfig = (/** @type {Configuration} */ config, /** @type {strin
 };
 
 // Read an options or config file in any format and return the object
-const readOptionsOrConfig = async (/** @type {string} */ configPath, /** @type {FsLike} */ fs, /** @type {boolean} */ noImport) => {
+const readOptionsOrConfig = async (/** @type {ExecutionContext} */ context, /** @type {string} */ configPath, /** @type {string | undefined} */ configPointer) => {
+  const { fs, noImport } = context;
   const basename = pathPosix.basename(configPath);
   const dirname = pathPosix.dirname(configPath);
   let options = null;
   let config = null;
+  let unknown = null;
   try {
     if (basename.endsWith(".markdownlint-cli2.jsonc")) {
-      options = jsonc_parse(await fs.promises.readFile(configPath, utf8));
+      options = await readJsonc(configPath, fs);
     } else if (basename.endsWith(".markdownlint-cli2.yaml")) {
-      options = yaml_parse(await fs.promises.readFile(configPath, utf8));
-    } else if (
-      basename.endsWith(".markdownlint-cli2.cjs") ||
-      basename.endsWith(".markdownlint-cli2.mjs")
-    ) {
+      options = await readYaml(configPath, fs);
+    } else if (basename.endsWith(".markdownlint-cli2.cjs") || basename.endsWith(".markdownlint-cli2.mjs")) {
       options = await importModule(dirname, basename, noImport);
-    } else if (
-      basename.endsWith(".markdownlint.jsonc") ||
-      basename.endsWith(".markdownlint.json") ||
-      basename.endsWith(".markdownlint.yaml") ||
-      basename.endsWith(".markdownlint.yml")
-    ) {
-      config = await readConfigPromise(configPath, parsers_parsers, fs);
-    } else if (
-      basename.endsWith(".markdownlint.cjs") ||
-      basename.endsWith(".markdownlint.mjs")
-    ) {
+    } else if (basename.endsWith(".markdownlint.jsonc") || basename.endsWith(".markdownlint.json")) {
+      config = await readJsonc(configPath, fs);
+    } else if (basename.endsWith(".markdownlint.yaml") || basename.endsWith(".markdownlint.yml")) {
+      config = await readYaml(configPath, fs);
+    } else if (basename.endsWith(".markdownlint.cjs") || basename.endsWith(".markdownlint.mjs")) {
       config = await importModule(dirname, basename, noImport);
+    } else if (basename.endsWith(".jsonc") || basename.endsWith(".json")) {
+      unknown = await readJsonc(configPath, fs);
+    } else if (basename.endsWith(".toml")) {
+      unknown = await readToml(configPath, fs);
+    } else if (basename.endsWith(".yaml") || basename.endsWith(".yml")) {
+      unknown = await readYaml(configPath, fs);
+    } else if (basename.endsWith(".cjs") || basename.endsWith(".mjs")) {
+      unknown = await importModule(dirname, basename, noImport);
     } else {
       throw new Error(
         "Configuration file should be one of the supported names " +
         "(e.g., '.markdownlint-cli2.jsonc') or a prefix with a supported name " +
-        "(e.g., 'example.markdownlint-cli2.jsonc')."
+        "(e.g., 'example.markdownlint-cli2.jsonc') or have a supported extension " +
+        "(e.g., jsonc, json, yaml, yml, cjs, mjs)."
       );
     }
   } catch (error) {
     throwForConfigurationFile(configPath, error);
   }
+  if (configPointer) {
+    const objects = [ options, config, unknown ];
+    [ options, config, unknown ] = objects.map((obj) => obj && (jsonpointer.get(obj, configPointer) || {}));
+  }
+  if (unknown) {
+    const keys = Object.keys(unknown);
+    if (keys.some((key) => cli2SchemaKeys.has(key))) {
+      options = unknown;
+    } else {
+      config = unknown;
+    }
+  }
   if (options) {
     if (options.config) {
-      options.config = await getExtendedConfig(options.config, configPath, fs);
+      options.config = await getExtendedConfig(context, options.config, configPath);
     }
     return options;
   }
-  config = await getExtendedConfig(config, configPath, fs);
+  config = await getExtendedConfig(context, config, configPath);
   return { config };
 };
 
@@ -77580,7 +79381,7 @@ const showHelp = (/** @type {Logger} */ logMessage, /** @type {boolean} */ showB
   }
   logMessage(`https://github.com/DavidAnson/markdownlint-cli2
 
-Syntax: markdownlint-cli2 glob0 [glob1] [...] [globN] [--config file] [--fix] [--format] [--help] [--no-globs]
+Syntax: markdownlint-cli2 glob0 [glob1] [...] [globN] [--config file] [--configPointer pointer] [--fix] [--format] [--help] [--no-globs]
 
 Glob expressions (from the globby library):
 - * matches any number of characters, but not /
@@ -77597,11 +79398,12 @@ Dot-only glob:
 - To lint every file in the current directory tree, the command "markdownlint-cli2 **" can be used instead
 
 Optional parameters:
-- --config    specifies the path to a configuration file to define the base configuration
-- --fix       updates files to resolve fixable issues (can be overridden in configuration)
-- --format    reads standard input (stdin), applies fixes, writes standard output (stdout)
-- --help      writes this message to the console and exits without doing anything else
-- --no-globs  ignores the "globs" property if present in the top-level options object
+- --config        specifies the path to a configuration file to define the base configuration
+- --configPointer specifies a JSON Pointer to a configuration object within the --config file
+- --fix           updates files to resolve fixable issues (can be overridden in configuration)
+- --format        reads standard input (stdin), applies fixes, writes standard output (stdout)
+- --help          writes this message to the console and exits without doing anything else
+- --no-globs      ignores the "globs" property if present in the top-level options object
 
 Configuration via:
 - .markdownlint-cli2.jsonc
@@ -77610,7 +79412,6 @@ Configuration via:
 - .markdownlint.jsonc or .markdownlint.json
 - .markdownlint.yaml or .markdownlint.yml
 - .markdownlint.cjs or .markdownlint.mjs
-- package.json
 
 Cross-platform compatibility:
 - UNIX and Windows shells expand globs according to different rules; quoting arguments is recommended
@@ -77627,18 +79428,17 @@ $ markdownlint-cli2 "**/*.md" "#node_modules"`
 };
 
 // Helpers for getAndProcessDirInfo/handleFirstMatchingConfigurationFile
-const readFileParseJson = (/** @type {ConfigurationHandlerParams} */ { file, fs }) => fs.promises.readFile(file, utf8).then(jsonc_parse);
-const readFileParseYaml = (/** @type {ConfigurationHandlerParams} */ { file, fs }) => fs.promises.readFile(file, utf8).then(yaml_parse);
-const readConfigWrapper = (/** @type {ConfigurationHandlerParams} */ { file, fs }) => readConfigPromise(file, parsers_parsers, fs);
+const readJsoncWrapper = (/** @type {ConfigurationHandlerParams} */ { file, fs }) => readJsonc(file, fs);
+const readYamlWrapper = (/** @type {ConfigurationHandlerParams} */ { file, fs }) => readYaml(file, fs);
+const readConfigWrapper = (/** @type {ConfigurationHandlerParams} */ { file, fs, parsers }) => readConfigPromise(file, parsers, fs);
 const importModuleWrapper = (/** @type {ConfigurationHandlerParams} */ { dir, file, noImport }) => importModule(dir, file, noImport);
 
 /** @type {ConfigurationFileAndHandler[] } */
 const optionsFiles = [
-  [ ".markdownlint-cli2.jsonc", readFileParseJson ],
-  [ ".markdownlint-cli2.yaml", readFileParseYaml ],
+  [ ".markdownlint-cli2.jsonc", readJsoncWrapper ],
+  [ ".markdownlint-cli2.yaml", readYamlWrapper ],
   [ ".markdownlint-cli2.cjs", importModuleWrapper ],
-  [ ".markdownlint-cli2.mjs", importModuleWrapper ],
-  [ "package.json", (params) => readFileParseJson(params).then((/** @type {any} */ obj) => (obj || {})[packageName]) ]
+  [ ".markdownlint-cli2.mjs", importModuleWrapper ]
 ];
 
 /** @type {ConfigurationFileAndHandler[] } */
@@ -77653,15 +79453,15 @@ const configurationFiles = [
 
 /**
  * Processes the first matching configuration file.
+ * @param {ExecutionContext} context Execution context.
  * @param {ConfigurationFileAndHandler[]} fileAndHandlers List of configuration files and handlers.
  * @param {string} dir Configuration file directory.
- * @param {FsLike} fs File system object.
- * @param {boolean} noImport No import.
  * @param {(file: string) => void} memoizeFile Function to memoize file name.
  * @returns {Promise<any>} Configuration file content.
  */
-const processFirstMatchingConfigurationFile = (fileAndHandlers, dir, fs, noImport, memoizeFile) =>
-  Promise.allSettled(
+const processFirstMatchingConfigurationFile = (context, fileAndHandlers, dir, memoizeFile) => {
+  const { fs, noImport, parsers } = context;
+  return Promise.allSettled(
     fileAndHandlers.map(([ name, handler ]) => {
       const file = pathPosix.join(dir, name);
       return fs.promises.access(file).then(() => [ file, handler ]);
@@ -77671,18 +79471,17 @@ const processFirstMatchingConfigurationFile = (fileAndHandlers, dir, fs, noImpor
       /** @type {ConfigurationFileAndHandler} */
       const [ file, handler ] = values.find((result) => (result.status === "fulfilled"))?.value || [ "[UNUSED]", markdownlint_cli2_noop ];
       memoizeFile(file);
-      return handler({ dir, file, fs, noImport });
+      return handler({ dir, file, fs, noImport, parsers });
     });
+};
 
 // Get (creating if necessary) and process a directory's info object
 const getAndProcessDirInfo = (
-  /** @type {FsLike} */ fs,
+  /** @type {ExecutionContext} */ context,
   /** @type {Task[]} */ tasks,
   /** @type {DirToDirInfo} */ dirToDirInfo,
   /** @type {string} */ dir,
-  /** @type {string | null} */ relativeDir,
-  /** @type {boolean} */ noImport,
-  /** @type {boolean} */ allowPackageJson
+  /** @type {string | null} */ relativeDir
 ) => {
   // Create dirInfo
   let dirInfo = dirToDirInfo[dir];
@@ -77701,22 +79500,16 @@ const getAndProcessDirInfo = (
     tasks.push(
 
       // Load markdownlint-cli2 object(s)
-      processFirstMatchingConfigurationFile(
-        allowPackageJson ? optionsFiles : optionsFiles.slice(0, -1),
-        dir,
-        fs,
-        noImport,
-        (file) => { cli2File = file; }
-      ).
+      processFirstMatchingConfigurationFile(context, optionsFiles, dir, (file) => { cli2File = file; }).
         then((/** @type {Options | null} */ options) => {
           dirInfo.markdownlintOptions = options;
           return options &&
             options.config &&
             getExtendedConfig(
+              context,
               options.config,
               // Just need to identify the right directory
-              pathPosix.join(dir, utf8),
-              fs
+              pathPosix.join(dir, utf8)
             ).
               then((config) => {
                 options.config = config;
@@ -77727,7 +79520,7 @@ const getAndProcessDirInfo = (
         }),
 
       // Load markdownlint object(s)
-      processFirstMatchingConfigurationFile(configurationFiles, dir, fs, noImport, markdownlint_cli2_noop).
+      processFirstMatchingConfigurationFile(context, configurationFiles, dir, markdownlint_cli2_noop).
         then((/** @type {Configuration | null} */ config) => {
           dirInfo.markdownlintConfig = config;
         })
@@ -77740,27 +79533,24 @@ const getAndProcessDirInfo = (
 
 // Get base markdownlint-cli2 options object
 const getBaseOptions = async (
-  /** @type {FsLike} */ fs,
-  /** @type {string} */ baseDir,
+  /** @type {ExecutionContext} */ context,
   /** @type {string | null} */ relativeDir,
   /** @type {string[]} */ globPatterns,
   /** @type {Options} */ options,
   /** @type {boolean} */ fixDefault,
-  /** @type {boolean} */ noGlobs,
-  /** @type {boolean} */ noImport
+  /** @type {boolean} */ noGlobs
 ) => {
+  const { baseDir } = context;
   /** @type {Task[]} */
   const tasks = [];
   /** @type {DirToDirInfo} */
   const dirToDirInfo = {};
   getAndProcessDirInfo(
-    fs,
+    context,
     tasks,
     dirToDirInfo,
     baseDir,
-    relativeDir,
-    noImport,
-    true
+    relativeDir
   );
   await Promise.all(tasks);
   // eslint-disable-next-line no-multi-assign
@@ -77793,15 +79583,13 @@ const getBaseOptions = async (
 
 // Enumerate files from globs and build directory infos
 const enumerateFiles = async (
-  /** @type {FsLike} */ fs,
-  /** @type {string} */ baseDirSystem,
-  /** @type {string} */ baseDir,
+  /** @type {ExecutionContext} */ context,
   /** @type {string[]} */ globPatterns,
   /** @type {DirToDirInfo} */ dirToDirInfo,
   /** @type {boolean} */ gitignore,
-  /** @type {string | undefined} */ ignoreFiles,
-  /** @type {boolean} */ noImport
+  /** @type {string | undefined} */ ignoreFiles
 ) => {
+  const { baseDir, baseDirSystem, fs } = context;
   /** @type {Task[]} */
   const tasks = [];
   /** @type {import("globby").Options} */
@@ -77845,13 +79633,11 @@ const enumerateFiles = async (
   for (const file of files) {
     const dir = pathPosix.dirname(file);
     const dirInfo = getAndProcessDirInfo(
-      fs,
+      context,
       tasks,
       dirToDirInfo,
       dir,
-      null,
-      noImport,
-      false
+      null
     );
     dirInfo.files.push(file);
   }
@@ -77860,11 +79646,10 @@ const enumerateFiles = async (
 
 // Enumerate (possibly missing) parent directories and update directory infos
 const enumerateParents = async (
-  /** @type {FsLike} */ fs,
-  /** @type {string} */ baseDir,
-  /** @type {DirToDirInfo} */ dirToDirInfo,
-  /** @type {boolean} */ noImport
+  /** @type {ExecutionContext} */ context,
+  /** @type {DirToDirInfo} */ dirToDirInfo
 ) => {
+  const { baseDir } = context;
   /** @type {Task[]} */
   const tasks = [];
 
@@ -77889,13 +79674,11 @@ const enumerateParents = async (
       lastDir = dir;
       const dirInfo =
         getAndProcessDirInfo(
-          fs,
+          context,
           tasks,
           dirToDirInfo,
           dir,
-          null,
-          noImport,
-          false
+          null
         );
       lastDirInfo.parent = dirInfo;
       lastDirInfo = dirInfo;
@@ -77911,31 +79694,23 @@ const enumerateParents = async (
 
 // Create directory info objects by enumerating file globs
 const createDirInfos = async (
-  /** @type {FsLike} */ fs,
-  /** @type {string} */ baseDirSystem,
-  /** @type {string} */ baseDir,
+  /** @type {ExecutionContext} */ context,
   /** @type {string[]} */ globPatterns,
   /** @type {DirToDirInfo} */ dirToDirInfo,
   /** @type {Options | undefined} */ optionsOverride,
   /** @type {boolean} */ gitignore,
-  /** @type {string | undefined} */ ignoreFiles,
-  /** @type {boolean} */ noImport
+  /** @type {string | undefined} */ ignoreFiles
 ) => {
   await enumerateFiles(
-    fs,
-    baseDirSystem,
-    baseDir,
+    context,
     globPatterns,
     dirToDirInfo,
     gitignore,
-    ignoreFiles,
-    noImport
+    ignoreFiles
   );
   await enumerateParents(
-    fs,
-    baseDir,
-    dirToDirInfo,
-    noImport
+    context,
+    dirToDirInfo
   );
 
   // Merge file lists with identical configuration
@@ -77951,6 +79726,7 @@ const createDirInfos = async (
       }
       delete dirToDirInfo[dir];
     } else {
+      const { noImport } = context;
       const { markdownlintOptions, relativeDir } = dirInfo;
       const effectiveDir = relativeDir || dir;
       const effectiveModulePaths = resolveModulePaths(
@@ -78050,7 +79826,13 @@ const createDirInfos = async (
 };
 
 // Lint files in groups by shared configuration
-const lintFiles = (/** @type {FsLike} */ fs, /** @type {DirInfo[]} */ dirInfos, /** @type {Record<string, string>} */ fileContents, /** @type {FormattingContext} */ formattingContext) => {
+const lintFiles = (
+  /** @type {ExecutionContext} */ context,
+  /** @type {DirInfo[]} */ dirInfos,
+  /** @type {Record<string, string>} */ fileContents,
+  /** @type {FormattingContext} */ formattingContext
+) => {
+  const { fs, parsers } = context;
   const tasks = [];
   // For each dirInfo
   for (const dirInfo of dirInfos) {
@@ -78094,7 +79876,7 @@ const lintFiles = (/** @type {FsLike} */ fs, /** @type {DirInfo[]} */ dirInfos, 
       "files": filteredFiles,
       "strings": filteredStrings,
       "config": markdownlintConfig || markdownlintOptions?.config,
-      "configParsers": parsers_parsers,
+      "configParsers": parsers,
       // @ts-ignore
       "customRules": markdownlintOptions.customRules,
       "frontMatter": markdownlintOptions?.frontMatter
@@ -78223,7 +80005,6 @@ const markdownlint_cli2_main = async (/** @type {Parameters} */ params) => {
     optionsDefault,
     optionsOverride,
     fileContents,
-    noImport,
     allowStdin
   } = params;
   let {
@@ -78233,6 +80014,7 @@ const markdownlint_cli2_main = async (/** @type {Parameters} */ params) => {
   const logMessage = params.logMessage || markdownlint_cli2_noop;
   const logError = params.logError || markdownlint_cli2_noop;
   const fs = params.fs || external_node_fs_namespaceObject;
+  const noImport = Boolean(params.noImport);
   const baseDirSystem =
     (directory && external_node_path_namespaceObject.resolve(directory)) ||
     process.cwd();
@@ -78244,6 +80026,9 @@ const markdownlint_cli2_main = async (/** @type {Parameters} */ params) => {
   /** @type {undefined | null | string} */
   // eslint-disable-next-line unicorn/no-useless-undefined
   let configPath = undefined;
+  /** @type {undefined | null | string} */
+  // eslint-disable-next-line unicorn/no-useless-undefined
+  let configPointer = undefined;
   let useStdin = false;
   let sawDashDash = false;
   let shouldShowHelp = false;
@@ -78252,6 +80037,8 @@ const markdownlint_cli2_main = async (/** @type {Parameters} */ params) => {
       return true;
     } else if (configPath === null) {
       configPath = arg;
+    } else if (configPointer === null) {
+      configPointer = arg;
     } else if ((arg === "-") && allowStdin) {
       useStdin = true;
       // eslint-disable-next-line unicorn/prefer-switch
@@ -78259,6 +80046,8 @@ const markdownlint_cli2_main = async (/** @type {Parameters} */ params) => {
       sawDashDash = true;
     } else if (arg === "--config") {
       configPath = null;
+    } else if (arg === "--configPointer") {
+      configPointer = null;
     } else if (arg === "--fix") {
       fixDefault = true;
     } else if (arg === "--format") {
@@ -78276,6 +80065,8 @@ const markdownlint_cli2_main = async (/** @type {Parameters} */ params) => {
   if (shouldShowHelp) {
     return showHelp(logMessage, true);
   }
+  /** @type {ExecutionContext} */
+  const context = { baseDir, baseDirSystem, fs, noImport, "parsers": parsers_parsers };
   // Read argv configuration file (if relevant and present)
   let optionsArgv = null;
   let relativeDir = null;
@@ -78283,23 +80074,19 @@ const markdownlint_cli2_main = async (/** @type {Parameters} */ params) => {
   let baseOptions = null;
   try {
     if (configPath) {
-      const resolvedConfigPath =
-        posixPath(external_node_path_namespaceObject.resolve(baseDirSystem, configPath));
-      optionsArgv =
-        await readOptionsOrConfig(resolvedConfigPath, fs, Boolean(noImport));
+      const resolvedConfigPath = posixPath(external_node_path_namespaceObject.resolve(baseDirSystem, configPath));
+      optionsArgv = await readOptionsOrConfig(context, resolvedConfigPath, configPointer);
       relativeDir = pathPosix.dirname(resolvedConfigPath);
     }
     // Process arguments and get base options
     globPatterns = processArgv(argvFiltered);
     baseOptions = await getBaseOptions(
-      fs,
-      baseDir,
+      context,
       relativeDir,
       globPatterns,
       optionsArgv || optionsDefault,
       fixDefault,
-      Boolean(noGlobs),
-      Boolean(noImport)
+      Boolean(noGlobs)
     );
   } finally {
     if (!baseOptions?.baseMarkdownlintOptions.noBanner && !formattingContext.formatting) {
@@ -78348,15 +80135,12 @@ const markdownlint_cli2_main = async (/** @type {Parameters} */ params) => {
     : undefined;
   const dirInfos =
     await createDirInfos(
-      fs,
-      baseDirSystem,
-      baseDir,
+      context,
       globPatterns,
       dirToDirInfo,
       optionsOverride,
       gitignore,
-      ignoreFiles,
-      Boolean(noImport)
+      ignoreFiles
     );
   // Output linting status
   if (showProgress) {
@@ -78373,7 +80157,7 @@ const markdownlint_cli2_main = async (/** @type {Parameters} */ params) => {
     logMessage(`Linting: ${fileCount} file(s)`);
   }
   // Lint files
-  const lintResults = await lintFiles(fs, dirInfos, resolvedFileContents, formattingContext);
+  const lintResults = await lintFiles(context, dirInfos, resolvedFileContents, formattingContext);
   // Output summary
   const results = createResults(baseDir, lintResults);
   if (showProgress) {
@@ -78420,6 +80204,15 @@ const markdownlint_cli2_main = async (/** @type {Parameters} */ params) => {
 /** @typedef {Promise<any>} Task */
 
 /**
+ * @typedef ExecutionContext
+ * @property {string} baseDir Base directory (POSIX).
+ * @property {string} baseDirSystem Base directory (non-POSIX).
+ * @property {FsLike} fs File system object.
+ * @property {boolean} noImport No import.
+ * @property {ConfigurationParser[]} parsers Configuration file parsers.
+ */
+
+/**
  * @typedef Parameters
  * @property {boolean} [allowStdin] Allow stdin.
  * @property {string[]} argv Arguments.
@@ -78437,11 +80230,14 @@ const markdownlint_cli2_main = async (/** @type {Parameters} */ params) => {
 
 /** @typedef {import("markdownlint").Configuration} Configuration */
 
+/** @typedef {import("markdownlint").ConfigurationParser} ConfigurationParser */
+
 /**
  * @typedef ConfigurationHandlerParams
  * @property {string} dir Configuration file directory.
  * @property {string} file Configuration file.
  * @property {FsLike} fs File system object.
+ * @property {ConfigurationParser[]} parsers Configuration file parsers.
  * @property {boolean} noImport No import.
  */
 
@@ -78519,7 +80315,7 @@ const markdownlint_cli2_main = async (/** @type {Parameters} */ params) => {
 
 
 const logMessage = info;
-const outputFormatter = (options) => {
+const outputFormatter = (/** @type {import("markdownlint-cli2").OutputFormatterOptions} */ options) => {
   const { results } = options;
   for (const lintError of results) {
     const {
@@ -78540,6 +80336,7 @@ const outputFormatter = (options) => {
     const information = ruleInformation ? ` ${ruleInformation}` : "";
     const message =
       `${fileName}${line}${column} ${name} ${ruleDescription}${detail}${context}${information}`;
+    /** @type {import("@actions/core").AnnotationProperties} */
     const annotation = {
       "title": ruleDescription,
       "file": fileName,
@@ -78568,16 +80365,24 @@ const config = getInput("config");
 if (config) {
   argv.push("--config", config);
 }
+const configPointer = getInput("configPointer");
+if (configPointer) {
+  argv.push("--configPointer", configPointer);
+}
 const fix = Boolean(getInput("fix"));
 if (fix) {
   argv.push("--fix");
 }
 
+/** @type {import("markdownlint-cli2").Parameters} */
 const parameters = {
   argv,
   logMessage,
   "optionsOverride": {
-    "outputFormatters": [ [ outputFormatter ] ]
+    "outputFormatters": [
+      // @ts-ignore
+      [ outputFormatter ]
+    ]
   }
 };
 markdownlint_cli2_main(parameters).then(
