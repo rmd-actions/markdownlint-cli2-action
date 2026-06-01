@@ -4,7 +4,7 @@ import * as core from "@actions/core";
 import { main as markdownlintCli2 } from "markdownlint-cli2";
 
 const logMessage = core.info;
-const outputFormatter = (options) => {
+const outputFormatter = (/** @type {import("markdownlint-cli2").OutputFormatterOptions} */ options) => {
   const { results } = options;
   for (const lintError of results) {
     const {
@@ -25,6 +25,7 @@ const outputFormatter = (options) => {
     const information = ruleInformation ? ` ${ruleInformation}` : "";
     const message =
       `${fileName}${line}${column} ${name} ${ruleDescription}${detail}${context}${information}`;
+    /** @type {import("@actions/core").AnnotationProperties} */
     const annotation = {
       "title": ruleDescription,
       "file": fileName,
@@ -53,16 +54,24 @@ const config = core.getInput("config");
 if (config) {
   argv.push("--config", config);
 }
+const configPointer = core.getInput("configPointer");
+if (configPointer) {
+  argv.push("--configPointer", configPointer);
+}
 const fix = Boolean(core.getInput("fix"));
 if (fix) {
   argv.push("--fix");
 }
 
+/** @type {import("markdownlint-cli2").Parameters} */
 const parameters = {
   argv,
   logMessage,
   "optionsOverride": {
-    "outputFormatters": [ [ outputFormatter ] ]
+    "outputFormatters": [
+      // @ts-ignore
+      [ outputFormatter ]
+    ]
   }
 };
 markdownlintCli2(parameters).then(
