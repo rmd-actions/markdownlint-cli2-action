@@ -58,6 +58,7 @@ const configPointer = core.getInput("configPointer");
 if (configPointer) {
   argv.push("--configPointer", configPointer);
 }
+// eslint-disable-next-line unicorn/consistent-boolean-name
 const fix = Boolean(core.getBooleanInput("fix"));
 if (fix) {
   argv.push("--fix");
@@ -74,6 +75,7 @@ const parameters = {
     ]
   }
 };
+// eslint-disable-next-line unicorn/prefer-await
 markdownlintCli2(parameters).then(
   (code) => code && core.setFailed(`Failed with exit code: ${code}`),
   (error) => core.setFailed(`Failed due to error: ${error}`)
