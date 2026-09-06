@@ -13790,7 +13790,13 @@ function processHeader (request, key, val) {
       } else if (typeof val[i] === 'object') {
         throw new InvalidArgumentError(`invalid ${key} header`)
       } else {
-        arr.push(`${val[i]}`)
+        // Coerce primitives (and reject unsafe coercions such as functions
+        // with a crafted toString/Symbol.toPrimitive).
+        const str = `${val[i]}`
+        if (!isValidHeaderValue(str)) {
+          throw new InvalidArgumentError(`invalid ${key} header`)
+        }
+        arr.push(str)
       }
     }
     val = arr
@@ -13801,7 +13807,12 @@ function processHeader (request, key, val) {
   } else if (val === null) {
     val = ''
   } else {
+    // Coerce primitives (and reject unsafe coercions such as functions
+    // with a crafted toString/Symbol.toPrimitive).
     val = `${val}`
+    if (!isValidHeaderValue(val)) {
+      throw new InvalidArgumentError(`invalid ${key} header`)
+    }
   }
 
   if (headerName === 'host') {
@@ -15173,6 +15184,7 @@ const {
   RequestContentLengthMismatchError,
   ResponseContentLengthMismatchError,
   RequestAbortedError,
+  InvalidArgumentError,
   HeadersTimeoutError,
   HeadersOverflowError,
   SocketError,
@@ -16156,8 +16168,16 @@ function writeH1 (client, request) {
     }
     body = bodyStream.stream
     contentLength = bodyStream.length
-  } else if (util.isBlobLike(body) && request.contentType == null && body.type) {
-    headers.push('content-type', body.type)
+  } else if (util.isBlobLike(body) && request.contentType == null) {
+    const contentType = body.type
+    if (contentType) {
+      const contentTypeValue = `${contentType}`
+      if (!util.isValidHeaderValue(contentTypeValue)) {
+        util.errorRequest(client, request, new InvalidArgumentError('invalid content-type header'))
+        return false
+      }
+      headers.push('content-type', contentTypeValue)
+    }
   }
 
   if (body && typeof body.read === 'function') {
@@ -19630,6 +19650,28 @@ function calculateRetryAfterHeader (retryAfter) {
   return new Date(retryAfter).getTime() - current
 }
 
+function validatePartialResponseContentLength (headers, range, statusCode, retryCount) {
+  const contentLength = headers['content-length']
+  if (contentLength == null) {
+    return null
+  }
+
+  if (!Number.isFinite(range.start) || !Number.isFinite(range.end)) {
+    return null
+  }
+
+  const length = Number(contentLength)
+  const expectedLength = range.end - range.start + 1
+  if (!Number.isFinite(length) || length !== expectedLength) {
+    return new RequestRetryError('Content-Length mismatch', statusCode, {
+      headers,
+      data: { count: retryCount }
+    })
+  }
+
+  return null
+}
+
 class RetryHandler {
   constructor (opts, handlers) {
     const { retryOptions, ...dispatchOpts } = opts
@@ -19844,6 +19886,12 @@ class RetryHandler {
         return false
       }
 
+      const contentLengthError = validatePartialResponseContentLength(headers, contentRange, statusCode, this.retryCount)
+      if (contentLengthError != null) {
+        this.abort(contentLengthError)
+        return false
+      }
+
       const { start, size, end = size - 1 } = contentRange
 
       assert(this.start === start, 'content-range mismatch')
@@ -19865,6 +19913,12 @@ class RetryHandler {
             resume,
             statusMessage
           )
+        }
+
+        const contentLengthError = validatePartialResponseContentLength(headers, range, statusCode, this.retryCount)
+        if (contentLengthError != null) {
+          this.abort(contentLengthError)
+          return false
         }
 
         const { start, size, end = size - 1 } = range
@@ -24111,7 +24165,7 @@ function validateCookiePath (path) {
 
     if (
       code < 0x20 || // exclude CTLs (0-31)
-      code === 0x7F || // DEL
+      code > 0x7E || // exclude DEL and non-ascii
       code === 0x3B // ;
     ) {
       throw new Error('Invalid cookie path')
@@ -24120,16 +24174,80 @@ function validateCookiePath (path) {
 }
 
 /**
- * I have no idea why these values aren't allowed to be honest,
- * but Deno tests these. - Khafra
+ * <let-dig> ::= <letter> | <digit>
+ *
+ * <letter> ::= any one of the 52 alphabetic characters A through Z in
+ * upper case and a through z in lower case
+ *
+ * <digit> ::= any one of the ten digits 0 through 9r
+ *
+ * @see https://www.rfc-editor.org/rfc/rfc1034#section-3.5
+ * @param {number} code
+ */
+function isLetterOrDigit (code) {
+  return (
+    (code >= 0x30 && code <= 0x39) || // 0-9
+    (code >= 0x41 && code <= 0x5A) || // A-Z
+    (code >= 0x61 && code <= 0x7A) // a-z
+  )
+}
+
+/**
+ * Validates a cookie domain against the "preferred name syntax".
+ *
+ * <domain>      ::= <subdomain> | " "
+ * <subdomain>   ::= <label> | <subdomain> "." <label>
+ * <label>       ::= <let-dig> [ [ <ldh-str> ] <let-dig> ]
+ * <ldh-str>     ::= <let-dig-hyp> | <let-dig-hyp> <ldh-str>
+ * <let-dig-hyp> ::= <let-dig> | "-"
+ *
+ * @see https://www.rfc-editor.org/rfc/rfc1034#section-3.5
+ * @see https://www.rfc-editor.org/rfc/rfc1123#section-2.1
+ * @see https://www.rfc-editor.org/rfc/rfc1035#section-2.3.4
  * @param {string} domain
  */
 function validateCookieDomain (domain) {
-  if (
-    domain.startsWith('-') ||
-    domain.endsWith('.') ||
-    domain.endsWith('-')
-  ) {
+  // <domain> ::= <subdomain> | " "
+  if (domain === ' ') {
+    return
+  }
+
+  if (domain.length > 255) {
+    throw new Error('Invalid cookie domain')
+  }
+
+  let labelLength = 0
+
+  for (let i = 0; i < domain.length; ++i) {
+    const code = domain.charCodeAt(i)
+
+    if (code === 0x2E) {
+      if (labelLength === 0) {
+        throw new Error('Invalid cookie domain')
+      }
+
+      if (domain.charCodeAt(i - 1) === 0x2D) { // "-"
+        throw new Error('Invalid cookie domain')
+      }
+
+      labelLength = 0
+      continue
+    }
+
+    if (labelLength === 0 && !isLetterOrDigit(code)) {
+      throw new Error('Invalid cookie domain')
+    }
+
+    if (!isLetterOrDigit(code) && code !== 0x2D) { // "-"
+      throw new Error('Invalid cookie domain')
+    }
+
+    if (++labelLength > 63) {
+      throw new Error('Invalid cookie domain')
+    }
+  }
+
+  if (labelLength === 0 || domain.charCodeAt(domain.length - 1) === 0x2D) { // "-"
     throw new Error('Invalid cookie domain')
   }
 }
@@ -24272,7 +24390,13 @@ function stringify (cookie) {
 
     const [key, ...value] = part.split('=')
 
-    out.push(`${key.trim()}=${value.join('=')}`)
+    const trimmedKey = key.trim()
+    const joinedValue = value.join('=')
+
+    validateCookieName(trimmedKey)
+    validateCookieValue(joinedValue)
+
+    out.push(`${trimmedKey}=${joinedValue}`)
   }
 
   return out.join('; ')
@@ -48910,6 +49034,9 @@ MarkdownIt.prototype.renderInline = function (src, env) {
 /******/ }
 /******/ 
 /************************************************************************/
+/******/ /* webpack/runtime/asset-relocator-loader */
+/******/ if (typeof __nccwpck_require__ !== 'undefined') __nccwpck_require__.ab = decodeURIComponent(new URL('.', import.meta.url).pathname).slice(import.meta.url.match(/^file:\/\/\/\w:/) ? 1 : 0, -1) + "/";
+/******/ 
 /******/ /* webpack/runtime/create fake namespace object */
 /******/ (() => {
 /******/ 	var getProto = Object.getPrototypeOf ? (obj) => (Object.getPrototypeOf(obj)) : (obj) => (obj.__proto__);
@@ -48967,10 +49094,6 @@ MarkdownIt.prototype.renderInline = function (src, env) {
 /******/ 		Object.defineProperty(exports, '__esModule', { value: true });
 /******/ 	};
 /******/ })();
-/******/ 
-/******/ /* webpack/runtime/compat */
-/******/ 
-/******/ if (typeof __nccwpck_require__ !== 'undefined') __nccwpck_require__.ab = new URL('.', import.meta.url).pathname.slice(import.meta.url.match(/^file:\/\/\/\w:/) ? 1 : 0, -1) + "/";
 /******/ 
 /************************************************************************/
 var __webpack_exports__ = {};
@@ -52311,6 +52434,8 @@ function slash(path) {
 
 
 
+
+
 const isNegativePattern = pattern => pattern[0] === '!';
 
 /**
@@ -52650,49 +52775,213 @@ const getParentGitignorePaths = (gitRoot, cwd) => {
 		.map(directory => external_node_path_namespaceObject.join(directory, '.gitignore'));
 };
 
+// The wildcards gitignore itself understands, when not escaped. Other characters micromatch
+// treats as syntax ((){}, extglobs, alternation) are literal in gitignore.
+const GITIGNORE_WILDCARDS = /(?<!\\)[*?[]/u;
+
+const hasGitignoreWildcards = value => GITIGNORE_WILDCARDS.test(value);
+
+// Characters micromatch reads as syntax where gitignore does not. A glob rule containing them
+// cannot be translated, and backslash escapes inside a glob cannot be safely carried through
+// the path handling below, so such rules are left to the predicate.
+const MICROMATCH_ONLY_SYNTAX = /[(){}|\\]/u;
+
+// In gitignore, `\x` means the literal character x.
+const unescapeGitignorePattern = value => value.replaceAll(/\\(.)/gu, '$1');
+
+// Turn gitignore-literal text into fast-glob-literal text, so characters like `+(` cannot be
+// misread as micromatch syntax.
+const toLiteralPattern = value => out.escapePath(unescapeGitignorePattern(value));
+
+const finalSegment = value => value.replace(/\/+$/u, '').split('/').pop();
+
+const isInsideCwd = relativePath => relativePath !== '' && !relativePath.startsWith('..') && !external_node_path_namespaceObject.isAbsolute(relativePath);
+
 /**
-Convert ignore patterns to fast-glob compatible format.
-Returns empty array if patterns should be handled by predicate only.
+Resolve a pattern anchored at the directory of its ignore file into a cwd-relative one.
 
-@param {string[]} patterns - Ignore patterns from .gitignore files
-@param {boolean} usingGitRoot - Whether patterns are relative to git root
-@param {Function} normalizeDirectoryPatternForFastGlob - Function to normalize directory patterns
-@returns {string[]} Patterns safe to pass to fast-glob, or empty array
+@param {string} directory - Directory of the ignore file that declared the rule.
+@param {string} body - The rule body, relative to that directory.
+@param {string} cwd - Directory the glob runs from.
+@returns {string|undefined} The cwd-relative pattern, or undefined when it targets something outside the cwd.
 */
-const convertPatternsForFastGlob = (patterns, usingGitRoot, normalizeDirectoryPatternForFastGlob) => {
-	// Determine which patterns are safe to pass to fast-glob
-	// If there are negation patterns, we can't pass file patterns to fast-glob
-	// because fast-glob doesn't understand negations and would filter out files
-	// that should be re-included by negation patterns.
-	// If we're using git root, patterns are relative to git root not cwd,
-	// so we can't pass them to fast-glob which expects cwd-relative patterns.
-	// We only pass patterns to fast-glob if there are NO negations AND we're not using git root.
+const anchorToCwd = (directory, body, cwd) => {
+	const relativePath = slash(external_node_path_namespaceObject.relative(cwd, external_node_path_namespaceObject.join(directory, body)));
+	return isInsideCwd(relativePath) ? relativePath : undefined;
+};
 
-	if (usingGitRoot) {
-		return []; // Patterns are relative to git root, not cwd
-	}
-
-	const result = [];
-	let hasNegations = false;
-
-	// Single pass to check for negations and collect positive patterns
-	for (const pattern of patterns) {
-		if (isNegativePattern(pattern)) {
-			hasNegations = true;
-			break; // Early exit on first negation
+// Compare names with the `ignore` package instead of guessing from the syntax, since it is the
+// same engine the predicate uses for the real decision.
+const createNameComparer = () => {
+	const nameMatchers = new Map();
+	const matchesName = (pattern, name) => {
+		let nameMatcher = nameMatchers.get(pattern);
+		if (!nameMatcher) {
+			nameMatcher = ignore().add([pattern]);
+			nameMatchers.set(pattern, nameMatcher);
 		}
 
-		// `.gitignore` patterns are relative to the repo root, but an anchored pattern like
-		// `/foo` looks like an absolute path to globby's directory-to-glob expansion, which
-		// resolves it against the real filesystem. When the checkout lives under a matching
-		// `/foo/…` path, `/foo` is a real ancestor directory and expands to `/foo/**`, which
-		// ignores the whole tree. Drop the leading slash so the pattern stays anchored to the
-		// cwd instead, letting fast-glob still skip the directory during traversal.
-		result.push(normalizeDirectoryPatternForFastGlob(pattern).replace(/^\//, ''));
+		return nameMatcher.ignores(name);
+	};
+
+	// A negation can only re-include the excluded path itself; nothing below it can be re-included once the directory is excluded. Two globs cannot be compared this way, so treat them as a possible match.
+	return (pattern, name) => {
+		if (hasGitignoreWildcards(pattern) && hasGitignoreWildcards(name)) {
+			return true;
+		}
+
+		return hasGitignoreWildcards(name) ? matchesName(name, pattern) : matchesName(pattern, name);
+	};
+};
+
+const getNegationFinalSegments = rules => rules
+	.filter(rule => isNegativePattern(rule.pattern))
+	.map(rule => finalSegment(rule.pattern.slice(1)))
+	.filter(Boolean);
+
+/**
+Check whether any negation in the given rules could re-include a path with one of the given names.
+
+Used after the pruned ignore-file search: a negation found by that search can re-include a directory the prune patterns skipped, which means ignore files inside it were never discovered.
+
+@param {Array<{pattern: string, directory: string}>} rules - Raw ignore-file lines and the directory of the ignore file that declared them.
+@param {string[]} names - The guard names returned by `buildPrunePatternsAndGuards`.
+@returns {boolean} Whether a negation could name one of them.
+*/
+const negationsCouldRescue = (rules, names) => {
+	if (names.length === 0) {
+		return false;
 	}
 
-	return hasNegations ? [] : result;
+	const couldNameTheSamePath = createNameComparer();
+	return getNegationFinalSegments(rules).some(negation => names.some(name => couldNameTheSamePath(name, negation)));
 };
+
+// Compute the prune pattern for a single rule, or undefined when the rule cannot be skipped safely. The returned object also carries the guard name (if any) whose skipping relies on the rule set being complete.
+const getRulePrune = ({pattern, directory}, {cwd, matcher, hasNegations, canSkipAtAnyDepth, canMatchIgnoreFile, gitignoreOnlySearch}) => {
+	if (isNegativePattern(pattern)) {
+		return undefined;
+	}
+
+	const isDirectoryPattern = pattern.endsWith('/');
+	const clean = pattern.replace(/\/+$/u, '');
+	if (!clean) {
+		return undefined;
+	}
+
+	// A leading `**/` is gitignore's explicit spelling of "match at any depth"; for a single trailing segment it is identical to the bare name (`**/foo` == `foo`). Drop it so the rule takes the any-depth branch below instead of being treated as an anchored glob.
+	const body = clean.startsWith('**/') && !clean.slice(3).includes('/')
+		? clean.slice(3)
+		: clean;
+
+	if (canMatchIgnoreFile(finalSegment(body))) {
+		// Contents-only rules such as `foo/*` still allow traversal to `foo/.gitignore`, so the ignore-file search must read it before pruning foo's contents.
+		return undefined;
+	}
+
+	const isGlob = hasGitignoreWildcards(body);
+	if (isGlob && MICROMATCH_ONLY_SYNTAX.test(body)) {
+		return undefined;
+	}
+
+	// The leading slash stops the normalizer from prefixing `**/`; the passed value already encodes the depth, and an extra `**/` would un-anchor an anchored rule.
+	const toFastGlob = value =>
+		normalizeDirectoryPatternForFastGlob(`/${value}${isDirectoryPattern ? '/' : ''}`).replace(/^\//u, '');
+
+	// No separator: matches at any depth below the ignore file that declared it.
+	if (!body.includes('/') && canSkipAtAnyDepth(body)) {
+		const relativeDirectory = slash(external_node_path_namespaceObject.relative(cwd, directory));
+		const prefix = isInsideCwd(relativeDirectory) ? `${out.escapePath(relativeDirectory)}/` : '';
+		return {pattern: toFastGlob(`${prefix}**/${isGlob ? body : toLiteralPattern(body)}`), guardName: body};
+	}
+
+	// Otherwise fall back to the single occurrence beside the ignore file, which names a concrete path that the matcher can verify directly.
+	const anchoredBody = body.replace(/^\//u, '');
+	const target = anchorToCwd(directory, isGlob ? anchoredBody : unescapeGitignorePattern(anchoredBody), cwd);
+	if (target === undefined) {
+		return undefined;
+	}
+
+	if (isGlob) {
+		// A glob does not name a concrete path, so the matcher cannot confirm it is ignored.
+		return hasNegations
+			? undefined
+			: {pattern: toFastGlob(target), guardName: finalSegment(target)};
+	}
+
+	if (!matcher(external_node_path_namespaceObject.resolve(cwd, target) + external_node_path_namespaceObject.sep).ignored) {
+		return undefined;
+	}
+
+	// A direct child of the cwd can only be re-included by a rule at or above the cwd, and in a pure gitignore search those rules are all known already. A deeper target has intermediate directories whose ignore files may not have been read yet.
+	const needsGuard = !gitignoreOnlySearch || target.includes('/');
+	return {
+		pattern: toFastGlob(out.escapePath(target)),
+		guardName: needsGuard ? finalSegment(target) : undefined,
+	};
+};
+
+/**
+Build the ignore patterns handed to fast-glob so it can skip ignored directories while traversing.
+
+The authoritative filter is always the predicate, so these patterns only ever need to be safe:
+skipping something the predicate would have kept loses files, while skipping less than possible
+merely costs time. Two facts from the gitignore spec make aggressive skipping safe anyway:
+
+- "It is not possible to re-include a file if a parent directory of that file is excluded."
+  So a directory that is still ignored once every negation has been applied can be skipped whole.
+- A pattern with no separator matches at any depth below its own ignore file, and one with a
+  separator is anchored to that file's directory. Working from the raw rules - rather than from
+  patterns already rebased onto some other directory - keeps that distinction intact, which is
+  what lets this work from a subdirectory of the repository too.
+
+The returned guard names are the directory names whose skipping relies on the given rules being
+complete. A caller working from a partial rule set (the ignore-file search) must watch for later
+negations that could name one of them; see `negationsCouldRescue`.
+
+@param {Array<{pattern: string, directory: string}>} rules - Raw ignore-file lines and the directory of the ignore file that declared them.
+@param {Function} matcher - The authoritative gitignore matcher.
+@param {string} cwd - Directory the glob runs from.
+@param {Object} [options] - Options.
+@param {boolean} [options.gitignoreOnlySearch] - Whether the rule set can only grow through nested `.gitignore` files.
+@param {boolean} [options.searchesForGitignoreFiles] - Whether the search includes `.gitignore` files.
+@returns {{patterns: string[], guardNames: string[]}} Patterns safe to pass to fast-glob, and the names their safety depends on.
+*/
+const buildPrunePatternsAndGuards = (rules, matcher, cwd, {gitignoreOnlySearch = false, searchesForGitignoreFiles = false} = {}) => {
+	if (!matcher || !cwd || !rules || rules.length === 0) {
+		return {patterns: [], guardNames: []};
+	}
+
+	const negationNames = getNegationFinalSegments(rules);
+	const couldNameTheSamePath = createNameComparer();
+	const context = {
+		cwd,
+		matcher,
+		hasNegations: negationNames.length > 0,
+		canSkipAtAnyDepth: pattern => !negationNames.some(name => couldNameTheSamePath(pattern, name)),
+		canMatchIgnoreFile: pattern => searchesForGitignoreFiles && couldNameTheSamePath(pattern, '.gitignore'),
+		gitignoreOnlySearch,
+	};
+
+	const patterns = [];
+	const guardNames = [];
+
+	for (const rule of rules) {
+		const prune = getRulePrune(rule, context);
+		if (!prune) {
+			continue;
+		}
+
+		patterns.push(prune.pattern);
+		if (prune.guardName !== undefined) {
+			guardNames.push(prune.guardName);
+		}
+	}
+
+	return {patterns, guardNames};
+};
+
+const convertPatternsForFastGlob = (rules, matcher, cwd) => buildPrunePatternsAndGuards(rules, matcher, cwd).patterns;
 
 ;// CONCATENATED MODULE: ./node_modules/globby/ignore.js
 
@@ -52807,14 +53096,43 @@ const globIgnoreFiles = (globFunction, patterns, normalizedOptions) => globFunct
 	...ignoreFilesGlobOptions, // Must be last to ensure absolute/dot flags stick
 });
 
-const getParentIgnorePaths = (gitRoot, normalizedOptions) => gitRoot
-	? getParentGitignorePaths(gitRoot, normalizedOptions.cwd)
-	: [];
+// Normalize a raw ignore-file line the way git does: strip a byte order mark and trailing whitespace. "Trailing spaces are ignored unless they are quoted with backslash" - a backslash-escaped trailing space is kept, still escaped, so the line can be re-fed to the `ignore` package without being stripped again.
+const normalizeIgnoreFileLine = line => {
+	line = line.replace(/^\uFEFF/u, '');
 
-const combineIgnoreFilePaths = (gitRoot, normalizedOptions, childPaths) => dedupePaths([
-	...getParentIgnorePaths(gitRoot, normalizedOptions),
-	...childPaths,
-]);
+	let whitespaceStart = line.length;
+	while (whitespaceStart > 0 && /\s/u.test(line[whitespaceStart - 1])) {
+		whitespaceStart--;
+	}
+
+	if (whitespaceStart === line.length) {
+		return line;
+	}
+
+	let backslashCount = 0;
+	for (let index = whitespaceStart - 1; index >= 0 && line[index] === '\\'; index--) {
+		backslashCount++;
+	}
+
+	return backslashCount % 2 === 1
+		? line.slice(0, whitespaceStart) + ' '
+		: line.slice(0, whitespaceStart);
+};
+
+const readIgnoreFileLines = content => content
+	.split(/\r?\n/)
+	.map(line => normalizeIgnoreFileLine(line))
+	.filter(line => line && !line.startsWith('#'));
+
+/**
+Get the lines of every ignore file, as git reads them, each paired with the directory of the file that declared them.
+
+Anchoring is only meaningful relative to that directory, and the rebased patterns have already lost it, so keep the originals for anything that has to reason about which paths a rule covers.
+*/
+const getIgnoreRules = files => files.flatMap(file => {
+	const directory = external_node_path_namespaceObject.dirname(file.filePath);
+	return readIgnoreFileLines(file.content).map(pattern => ({pattern, directory}));
+});
 
 const buildIgnoreResult = (files, normalizedOptions, gitRoot) => {
 	const baseDir = gitRoot || normalizedOptions.cwd;
@@ -52823,6 +53141,7 @@ const buildIgnoreResult = (files, normalizedOptions, gitRoot) => {
 
 	return {
 		patterns,
+		rules: getIgnoreRules(files),
 		matcher,
 		predicate: fileOrDirectory => matcher(fileOrDirectory).ignored,
 		usingGitRoot: Boolean(gitRoot && gitRoot !== normalizedOptions.cwd),
@@ -52867,11 +53186,7 @@ const applyBaseToPattern = (pattern, base) => {
 
 const parseIgnoreFile = (file, cwd) => {
 	const base = slash(external_node_path_namespaceObject.relative(cwd, external_node_path_namespaceObject.dirname(file.filePath)));
-
-	return file.content
-		.split(/\r?\n/)
-		.filter(line => line && !line.startsWith('#'))
-		.map(pattern => applyBaseToPattern(pattern, base));
+	return readIgnoreFileLines(file.content).map(pattern => applyBaseToPattern(pattern, base));
 };
 
 const toRelativePath = (fileOrDirectory, cwd) => {
@@ -53205,6 +53520,7 @@ const createExcludesFileValue = (value, declaringFilePath) => ({
 
 /**
 Parse git config content and return the excludesFile value and any include paths to recurse into.
+
 The caller is responsible for reading files and recursing (sync or async).
 */
 const parseGitConfigForExcludesFile = (content, normalizedPath, gitDirectory) => {
@@ -53479,30 +53795,149 @@ const buildGlobalPredicate = (globalIgnoreFile, cwd, rootDirectory = cwd) => {
 	return fileOrDirectory => matcher(fileOrDirectory).ignored;
 };
 
+/**
+Ignore files at or above the cwd can be located without traversing anything.
+
+Reading them before searching for the nested ones lets the search itself skip whole ignored directories. Otherwise the recursive search for ignore files walks even the directories that the same `.gitignore` excludes, so a large ignored directory (a mounted share, a build output) is enumerated on every call.
+*/
+const getKnownIgnoreFilePaths = (patterns, normalizedOptions, gitRoot) => {
+	const searchPatterns = [patterns].flat();
+	const isGitignoreSearch = searchPatterns.includes(GITIGNORE_FILES_PATTERN);
+	if (!isGitignoreSearch) {
+		return [];
+	}
+
+	return gitRoot
+		? getParentGitignorePaths(gitRoot, normalizedOptions.cwd)
+		: [external_node_path_namespaceObject.join(normalizedOptions.cwd, '.gitignore')];
+};
+
+const getKnownIgnoreFileSearchOptions = (patterns, normalizedOptions) => ({
+	...normalizedOptions,
+	ignore: [
+		...normalizedOptions.ignore,
+		// Keep negative search patterns active when the known candidates are matched independently.
+		...[patterns].flat()
+			.filter(pattern => isNegativePattern(pattern))
+			.map(pattern => pattern.slice(1)),
+	],
+});
+
+const getKnownIgnoreFilePattern = (filePath, cwd) => {
+	// Relative candidates keep cwd-relative exclusions such as `.gitignore` meaningful; parent candidates must remain absolute because they are outside cwd.
+	const pattern = isPathInside(filePath, cwd) ? external_node_path_namespaceObject.relative(cwd, filePath) : filePath;
+	return out.convertPathToPattern(pattern);
+};
+
+const getMatchingKnownIgnoreFilePaths = (knownPaths, matchingPaths) => {
+	// Fast-glob normalizes its results, so compare resolved paths before returning the original paths for reading.
+	const matchingPathSet = new Set(matchingPaths.map(filePath => external_node_path_namespaceObject.resolve(filePath)));
+
+	return knownPaths.filter(filePath => matchingPathSet.has(external_node_path_namespaceObject.resolve(filePath)));
+};
+
+const globKnownIgnoreFilePaths = (globFunction, knownPaths, patterns, normalizedOptions) => {
+	if (knownPaths.length === 0) {
+		return [];
+	}
+
+	return globIgnoreFiles(
+		globFunction,
+		knownPaths.map(filePath => getKnownIgnoreFilePattern(filePath, normalizedOptions.cwd)),
+		getKnownIgnoreFileSearchOptions(patterns, normalizedOptions),
+	);
+};
+
+const filterKnownIgnoreFilePathsAsync = async (knownPaths, patterns, normalizedOptions) => {
+	const matchingPaths = await globKnownIgnoreFilePaths(out, knownPaths, patterns, normalizedOptions);
+	return getMatchingKnownIgnoreFilePaths(knownPaths, matchingPaths);
+};
+
+const filterKnownIgnoreFilePathsSync = (knownPaths, patterns, normalizedOptions) => {
+	const matchingPaths = globKnownIgnoreFilePaths(out.sync, knownPaths, patterns, normalizedOptions);
+	return getMatchingKnownIgnoreFilePaths(knownPaths, matchingPaths);
+};
+
+const getIgnoreFileSearchPrune = (searchPatterns, files, normalizedOptions, gitRoot) => {
+	if (files.length === 0) {
+		return {patterns: [], guardNames: []};
+	}
+
+	const {cwd} = normalizedOptions;
+	const baseDir = gitRoot || cwd;
+	const ignorePatterns = getPatternsFromIgnoreFiles(files, baseDir);
+	const matcher = createIgnoreMatcher(ignorePatterns, cwd, baseDir);
+
+	// Custom ignore files can live anywhere, including beside the cwd, so only a pure `.gitignore` search may treat the rules at or above the cwd as complete.
+	const searchPatternsArray = [searchPatterns].flat();
+	const gitignoreOnlySearch = searchPatternsArray.every(pattern => pattern === GITIGNORE_FILES_PATTERN);
+	const searchesForGitignoreFiles = searchPatternsArray.includes(GITIGNORE_FILES_PATTERN);
+
+	return buildPrunePatternsAndGuards(getIgnoreRules(files), matcher, cwd, {gitignoreOnlySearch, searchesForGitignoreFiles});
+};
+
+const withPrunedSearch = (normalizedOptions, prunePatterns) => prunePatterns.length === 0
+	? normalizedOptions
+	: {...normalizedOptions, ignore: [...normalizedOptions.ignore, ...prunePatterns]};
+
+// The known ignore files have already been read; only the newly discovered ones are left.
+const getUnreadPaths = (childPaths, knownPaths) => {
+	const alreadyRead = new Set(knownPaths.map(filePath => external_node_path_namespaceObject.resolve(filePath)));
+	return dedupePaths(childPaths).filter(filePath => !alreadyRead.has(external_node_path_namespaceObject.resolve(filePath)));
+};
+
 const collectIgnoreFileArtifactsAsync = async (patterns, options, includeParentIgnoreFiles) => {
 	const normalizedOptions = normalizeOptions(options);
-	const childPaths = await globIgnoreFiles(out, patterns, normalizedOptions);
+	const readFileMethod = getReadFileMethod(normalizedOptions.fs);
 	const gitRoot = includeParentIgnoreFiles
 		? await findGitRoot(normalizedOptions.cwd, normalizedOptions.fs)
 		: undefined;
-	const allPaths = combineIgnoreFilePaths(gitRoot, normalizedOptions, childPaths);
-	const readFileMethod = getReadFileMethod(normalizedOptions.fs);
-	const files = await readIgnoreFilesSafely(allPaths, readFileMethod, normalizedOptions.suppressErrors);
 
-	return {files, normalizedOptions, gitRoot};
+	const knownPaths = await filterKnownIgnoreFilePathsAsync(
+		getKnownIgnoreFilePaths(patterns, normalizedOptions, gitRoot),
+		patterns,
+		normalizedOptions,
+	);
+	const knownFiles = await readIgnoreFilesSafely(knownPaths, readFileMethod, normalizedOptions.suppressErrors);
+	const {patterns: prunePatterns, guardNames} = getIgnoreFileSearchPrune(patterns, knownFiles, normalizedOptions, gitRoot);
+
+	const childPaths = await globIgnoreFiles(out, patterns, withPrunedSearch(normalizedOptions, prunePatterns));
+	let childFiles = await readIgnoreFilesSafely(getUnreadPaths(childPaths, knownPaths), readFileMethod, normalizedOptions.suppressErrors);
+
+	// A negation found by the pruned search can re-include a directory the prune patterns skipped, hiding the ignore files inside it. Repeat the search without pruning when that happens; a single unpruned pass finds everything, so once is enough.
+	if (negationsCouldRescue(getIgnoreRules(childFiles), guardNames)) {
+		const allPaths = await globIgnoreFiles(out, patterns, normalizedOptions);
+		childFiles = await readIgnoreFilesSafely(getUnreadPaths(allPaths, knownPaths), readFileMethod, normalizedOptions.suppressErrors);
+	}
+
+	return {files: [...knownFiles, ...childFiles], normalizedOptions, gitRoot};
 };
 
 const collectIgnoreFileArtifactsSync = (patterns, options, includeParentIgnoreFiles) => {
 	const normalizedOptions = normalizeOptions(options);
-	const childPaths = globIgnoreFiles(out.sync, patterns, normalizedOptions);
+	const readFileSyncMethod = getReadFileSyncMethod(normalizedOptions.fs);
 	const gitRoot = includeParentIgnoreFiles
 		? findGitRootSync(normalizedOptions.cwd, normalizedOptions.fs)
 		: undefined;
-	const allPaths = combineIgnoreFilePaths(gitRoot, normalizedOptions, childPaths);
-	const readFileSyncMethod = getReadFileSyncMethod(normalizedOptions.fs);
-	const files = readIgnoreFilesSafelySync(allPaths, readFileSyncMethod, normalizedOptions.suppressErrors);
 
-	return {files, normalizedOptions, gitRoot};
+	const knownPaths = filterKnownIgnoreFilePathsSync(
+		getKnownIgnoreFilePaths(patterns, normalizedOptions, gitRoot),
+		patterns,
+		normalizedOptions,
+	);
+	const knownFiles = readIgnoreFilesSafelySync(knownPaths, readFileSyncMethod, normalizedOptions.suppressErrors);
+	const {patterns: prunePatterns, guardNames} = getIgnoreFileSearchPrune(patterns, knownFiles, normalizedOptions, gitRoot);
+
+	const childPaths = globIgnoreFiles(out.sync, patterns, withPrunedSearch(normalizedOptions, prunePatterns));
+	let childFiles = readIgnoreFilesSafelySync(getUnreadPaths(childPaths, knownPaths), readFileSyncMethod, normalizedOptions.suppressErrors);
+
+	// See `collectIgnoreFileArtifactsAsync`: a rescuing negation means the pruned search may have missed files.
+	if (negationsCouldRescue(getIgnoreRules(childFiles), guardNames)) {
+		const allPaths = globIgnoreFiles(out.sync, patterns, normalizedOptions);
+		childFiles = readIgnoreFilesSafelySync(getUnreadPaths(allPaths, knownPaths), readFileSyncMethod, normalizedOptions.suppressErrors);
+	}
+
+	return {files: [...knownFiles, ...childFiles], normalizedOptions, gitRoot};
 };
 
 const isIgnoredByIgnoreFiles = async (patterns, options) => {
@@ -53524,7 +53959,7 @@ This avoids reading the same files twice (once for patterns, once for filtering)
 @param {string[]} patterns - Patterns to find ignore files
 @param {Object} options - Options object
 @param {boolean} [includeParentIgnoreFiles=false] - Whether to search for parent .gitignore files
-@returns {Promise<{patterns: string[], matcher: Function, predicate: Function, usingGitRoot: boolean}>}
+@returns {Promise<{patterns: string[], rules: Array<{pattern: string, directory: string}>, matcher: Function, predicate: Function, usingGitRoot: boolean}>}
 */
 const getIgnorePatternsAndPredicate = async (patterns, options, includeParentIgnoreFiles = false) => {
 	const {files, normalizedOptions, gitRoot} = await collectIgnoreFileArtifactsAsync(
@@ -53542,7 +53977,7 @@ Read ignore files and return both patterns and predicate (sync version).
 @param {string[]} patterns - Patterns to find ignore files
 @param {Object} options - Options object
 @param {boolean} [includeParentIgnoreFiles=false] - Whether to search for parent .gitignore files
-@returns {{patterns: string[], matcher: Function, predicate: Function, usingGitRoot: boolean}}
+@returns {{patterns: string[], rules: Array<{pattern: string, directory: string}>, matcher: Function, predicate: Function, usingGitRoot: boolean}}
 */
 const getIgnorePatternsAndPredicateSync = (patterns, options, includeParentIgnoreFiles = false) => {
 	const {files, normalizedOptions, gitRoot} = collectIgnoreFileArtifactsSync(
@@ -53775,31 +54210,28 @@ const combinePredicate = (matcher, globalMatcher) => {
 	};
 };
 
-const buildIgnoreFilterResult = (options, cwd, {patterns, matcher, usingGitRoot}, globalMatcher, createFilter) => {
+const buildIgnoreFilterResult = ({options, cwd, ignoreResult: {rules, matcher}, globalMatcher, createFilter}) => {
 	const finalPredicate = combinePredicate(matcher, globalMatcher);
 
-	// Convert patterns to fast-glob format (may return empty array if predicate should handle everything)
-	const patternsForFastGlob = convertPatternsForFastGlob(patterns, usingGitRoot, normalizeDirectoryPatternForFastGlob);
+	// Patterns fast-glob can use to skip ignored directories while traversing. The predicate below stays authoritative, so this only ever needs to be safe, never exhaustive. They are returned separately from `options.ignore` so they skip directory expansion and the parent-directory adjustment, which would rebase them outside the scope their ignore files govern.
+	const pruneIgnorePatterns = convertPatternsForFastGlob(rules, matcher, cwd);
 
 	return {
-		options: {
-			...options,
-			ignore: [...options.ignore, ...patternsForFastGlob],
-		},
+		options,
+		pruneIgnorePatterns,
 		filter: createFilter(finalPredicate, cwd, options.fs),
 	};
 };
 
 /**
-Apply gitignore patterns to options and return filter predicate.
+Apply ignore files to options and return the filter predicate.
 
-When negation patterns are present (e.g., '!important.log'), we cannot pass positive patterns to fast-glob because it would filter out files before our predicate can re-include them. In this case, we rely entirely on the predicate for filtering, which handles negations correctly.
+The predicate handles every rule, including negations, and is the authoritative filter applied
+to fast-glob's results. Rules that provably cannot be affected by negations are additionally
+translated into fast-glob `ignore` patterns, so whole ignored directories are skipped during
+traversal; see `convertPatternsForFastGlob`.
 
-When there are no negations, we optimize by passing patterns to fast-glob's ignore option to skip directories during traversal (performance optimization).
-
-All patterns (including negated) are always used in the filter predicate to ensure correct Git-compatible behavior.
-
-@returns {Promise<{options: Object, filter: Function}>}
+@returns {Promise<{options: Object, pruneIgnorePatterns: string[], filter: Function}>}
 */
 const applyIgnoreFilesAndGetFilter = async options => {
 	const cwd = options.cwd ?? external_node_process_namespaceObject.cwd();
@@ -53809,6 +54241,7 @@ const applyIgnoreFilesAndGetFilter = async options => {
 	if (ignoreFilesPatterns.length === 0 && !globalIgnoreFile) {
 		return {
 			options,
+			pruneIgnorePatterns: [],
 			filter: createFilterFunctionAsync(false, cwd, options.fs),
 		};
 	}
@@ -53818,18 +54251,24 @@ const applyIgnoreFilesAndGetFilter = async options => {
 	const includeParentIgnoreFiles = options.gitignore === true;
 	const ignoreResult = ignoreFilesPatterns.length > 0
 		? await getIgnorePatternsAndPredicate(ignoreFilesPatterns, options, includeParentIgnoreFiles)
-		: {patterns: [], matcher: false, usingGitRoot: false};
+		: {rules: [], matcher: false};
 
 	const globalGitRoot = globalIgnoreFile ? await findGitRoot(cwd, options.fs) : undefined;
 	const globalMatcher = globalIgnoreFile ? buildGlobalMatcher(globalIgnoreFile, cwd, globalGitRoot ?? cwd) : undefined;
 
-	return buildIgnoreFilterResult(options, cwd, ignoreResult, globalMatcher, createFilterFunctionAsync);
+	return buildIgnoreFilterResult({
+		options,
+		cwd,
+		ignoreResult,
+		globalMatcher,
+		createFilter: createFilterFunctionAsync,
+	});
 };
 
 /**
-Apply gitignore patterns to options and return filter predicate (sync version).
+Apply ignore files to options and return the filter predicate (sync version).
 
-@returns {{options: Object, filter: Function}}
+@returns {{options: Object, pruneIgnorePatterns: string[], filter: Function}}
 */
 const applyIgnoreFilesAndGetFilterSync = options => {
 	const cwd = options.cwd ?? external_node_process_namespaceObject.cwd();
@@ -53839,6 +54278,7 @@ const applyIgnoreFilesAndGetFilterSync = options => {
 	if (ignoreFilesPatterns.length === 0 && !globalIgnoreFile) {
 		return {
 			options,
+			pruneIgnorePatterns: [],
 			filter: createFilterFunction(false, cwd, options.fs),
 		};
 	}
@@ -53848,12 +54288,18 @@ const applyIgnoreFilesAndGetFilterSync = options => {
 	const includeParentIgnoreFiles = options.gitignore === true;
 	const ignoreResult = ignoreFilesPatterns.length > 0
 		? getIgnorePatternsAndPredicateSync(ignoreFilesPatterns, options, includeParentIgnoreFiles)
-		: {patterns: [], matcher: false, usingGitRoot: false};
+		: {rules: [], matcher: false};
 
 	const globalGitRoot = globalIgnoreFile ? findGitRootSync(cwd, options.fs) : undefined;
 	const globalMatcher = globalIgnoreFile ? buildGlobalMatcher(globalIgnoreFile, cwd, globalGitRoot ?? cwd) : undefined;
 
-	return buildIgnoreFilterResult(options, cwd, ignoreResult, globalMatcher, createFilterFunction);
+	return buildIgnoreFilterResult({
+		options,
+		cwd,
+		ignoreResult,
+		globalMatcher,
+		createFilter: createFilterFunction,
+	});
 };
 
 const assertGlobalGitignoreSyncSupport = options => {
@@ -54087,18 +54533,31 @@ const applyParentDirectoryIgnoreAdjustments = tasks => tasks.map(task => ({
 	},
 }));
 
+// Prune patterns are appended after directory expansion and the parent-directory adjustment on
+// purpose: they are already glob-shaped, and rebasing them onto a `../` prefix would let them
+// ignore paths outside the scope of the ignore files they came from.
+const appendPruneIgnorePatterns = (tasks, pruneIgnorePatterns) => pruneIgnorePatterns.length === 0
+	? tasks
+	: tasks.map(task => ({
+		patterns: task.patterns,
+		options: {
+			...task.options,
+			ignore: [...task.options.ignore, ...pruneIgnorePatterns],
+		},
+	}));
+
 const normalizeExpandDirectoriesOption = (options, cwd) => ({
 	...(cwd ? {cwd} : {}),
 	...(Array.isArray(options) ? {files: options} : options),
 });
 
-const generateTasks = async (patterns, options) => {
+const generateTasks = async (patterns, options, pruneIgnorePatterns = []) => {
 	const globTasks = convertNegativePatterns(patterns, options);
 
 	const {cwd, expandDirectories, fs: fsImplementation} = options;
 
 	if (!expandDirectories) {
-		return applyParentDirectoryIgnoreAdjustments(globTasks);
+		return appendPruneIgnorePatterns(applyParentDirectoryIgnoreAdjustments(globTasks), pruneIgnorePatterns);
 	}
 
 	const directoryToGlobOptions = {
@@ -54106,7 +54565,7 @@ const generateTasks = async (patterns, options) => {
 		fs: fsImplementation,
 	};
 
-	return Promise.all(globTasks.map(async task => {
+	const tasks = await Promise.all(globTasks.map(async task => {
 		let {patterns, options} = task;
 
 		[
@@ -54122,14 +54581,16 @@ const generateTasks = async (patterns, options) => {
 
 		return {patterns, options};
 	}));
+
+	return appendPruneIgnorePatterns(tasks, pruneIgnorePatterns);
 };
 
-const generateTasksSync = (patterns, options) => {
+const generateTasksSync = (patterns, options, pruneIgnorePatterns = []) => {
 	const globTasks = convertNegativePatterns(patterns, options);
 	const {cwd, expandDirectories, fs: fsImplementation} = options;
 
 	if (!expandDirectories) {
-		return applyParentDirectoryIgnoreAdjustments(globTasks);
+		return appendPruneIgnorePatterns(applyParentDirectoryIgnoreAdjustments(globTasks), pruneIgnorePatterns);
 	}
 
 	const directoryToGlobSyncOptions = {
@@ -54137,7 +54598,7 @@ const generateTasksSync = (patterns, options) => {
 		fs: fsImplementation,
 	};
 
-	return globTasks.map(task => {
+	const tasks = globTasks.map(task => {
 		let {patterns, options} = task;
 		patterns = directoryToGlobSync(patterns, directoryToGlobSyncOptions);
 		options.ignore = directoryToGlobSync(options.ignore, {cwd, fs: fsImplementation});
@@ -54147,16 +54608,18 @@ const generateTasksSync = (patterns, options) => {
 
 		return {patterns, options};
 	});
+
+	return appendPruneIgnorePatterns(tasks, pruneIgnorePatterns);
 };
 
 const globby = normalizeArguments(async (patterns, options) => {
 	assertGlobalGitignoreAsyncSupport(options);
 
 	// Apply ignore files and get filter (reads .gitignore files once)
-	const {options: modifiedOptions, filter} = await applyIgnoreFilesAndGetFilter(options);
+	const {options: modifiedOptions, pruneIgnorePatterns, filter} = await applyIgnoreFilesAndGetFilter(options);
 
-	// Generate tasks with modified options (includes gitignore patterns in ignore option)
-	const tasks = await generateTasks(patterns, modifiedOptions);
+	// Generate tasks, attaching the prune patterns so fast-glob skips ignored directories
+	const tasks = await generateTasks(patterns, modifiedOptions, pruneIgnorePatterns);
 
 	const results = await Promise.all(tasks.map(task => out(task.patterns, task.options)));
 	return unionFastGlobResultsAsync(results, filter);
@@ -54166,10 +54629,10 @@ const globbySync = normalizeArgumentsSync((patterns, options) => {
 	assertGlobalGitignoreSyncSupport(options);
 
 	// Apply ignore files and get filter (reads .gitignore files once)
-	const {options: modifiedOptions, filter} = applyIgnoreFilesAndGetFilterSync(options);
+	const {options: modifiedOptions, pruneIgnorePatterns, filter} = applyIgnoreFilesAndGetFilterSync(options);
 
-	// Generate tasks with modified options (includes gitignore patterns in ignore option)
-	const tasks = generateTasksSync(patterns, modifiedOptions);
+	// Generate tasks, attaching the prune patterns so fast-glob skips ignored directories
+	const tasks = generateTasksSync(patterns, modifiedOptions, pruneIgnorePatterns);
 
 	const results = tasks.map(task => out.sync(task.patterns, task.options));
 	return unionFastGlobResults(results, filter);
@@ -54181,10 +54644,10 @@ const globbyStream = normalizeArgumentsSync((patterns, options) => {
 	const seen = new Set();
 	const stream = external_node_stream_.Readable.from((async function * () {
 		// Apply ignore files and get filter (reads .gitignore files once)
-		const {options: modifiedOptions, filter} = await applyIgnoreFilesAndGetFilter(options);
+		const {options: modifiedOptions, pruneIgnorePatterns, filter} = await applyIgnoreFilesAndGetFilter(options);
 
-		// Generate tasks with modified options (includes gitignore patterns in ignore option)
-		const tasks = await generateTasks(patterns, modifiedOptions);
+		// Generate tasks, attaching the prune patterns so fast-glob skips ignored directories
+		const tasks = await generateTasks(patterns, modifiedOptions, pruneIgnorePatterns);
 
 		if (tasks.length === 0) {
 			return;
@@ -72710,8 +73173,9 @@ function ansiRegex({onlyFirst = false} = {}) {
 	// Valid string terminator sequences are BEL, ESC\, and 0x9c
 	const ST = '(?:\\u0007|\\u001B\\u005C|\\u009C)';
 
-	// OSC sequences only: ESC ] ... ST (non-greedy until the first ST)
-	const osc = `(?:\\u001B\\][\\s\\S]*?${ST})`;
+	// OSC sequences only: ESC ] ... ST
+	// The payload stops at the first terminator character rather than scanning ahead for one, so an unterminated `ESC ]` cannot rescan the rest of the input. Terminals likewise abort a control string on an unexpected ESC.
+	const osc = `(?:\\u001B\\][^\\u0007\\u001B\\u009C]*${ST})`;
 
 	// CSI and related: ESC/C1, optional intermediates, optional params (supports ; and :) then final byte
 	const csi = '[\\u001B\\u009B][[\\]()#;?]*(?:\\d{1,4}(?:[;:]\\d{0,4})*)?[\\dA-PR-TZcf-nq-uy=><~]';
@@ -75199,7 +75663,7 @@ const appendToArray = (destination, source) => {
 // @ts-check
 
 const packageName = "markdownlint-cli2";
-const packageVersion = "0.23.1";
+const packageVersion = "0.23.2";
 
 const libraryName = "markdownlint";
 
@@ -76482,7 +76946,7 @@ const tomlParse = (text) => parse_parse(text);
 /* harmony default export */ const toml_parse = (tomlParse);
 
 ;// CONCATENATED MODULE: ./node_modules/js-yaml/dist/js-yaml.mjs
-/*! js-yaml 5.2.1 https://github.com/nodeca/js-yaml @license MIT */
+/*! js-yaml 5.2.2 https://github.com/nodeca/js-yaml @license MIT */
 //#region src/tag.ts
 var NOT_RESOLVED = Symbol("NOT_RESOLVED");
 var MERGE_KEY = Symbol("MERGE_KEY");
@@ -77923,6 +78387,17 @@ function addMappingEvent(state, start, anchorStart, anchorEnd, tagStart, tagEnd,
 		style
 	});
 }
+function insertFlowPairMappingEvent(state, snapshot) {
+	state.events.splice(snapshot.eventsLength, 0, {
+		type: 3,
+		start: snapshot.position,
+		anchorStart: NO_RANGE$1,
+		anchorEnd: NO_RANGE$1,
+		tagStart: NO_RANGE$1,
+		tagEnd: NO_RANGE$1,
+		style: 2
+	});
+}
 function addScalarEvent(state, valueStart, valueEnd, anchorStart, anchorEnd, tagStart, tagEnd, style, chomping = 1, indent = -1, fast = false) {
 	state.events.push({
 		type: 4,
@@ -78366,12 +78841,8 @@ function readFlowCollection(state, nodeIndent, props) {
 			state.position++;
 			skipFlowSeparationSpace(state, nodeIndent);
 			if (!isMapping) {
-				restoreState(state, entryStart);
-				addMappingEvent(state, entryStart.position, NO_RANGE$1, NO_RANGE$1, NO_RANGE$1, NO_RANGE$1, 2);
-				if (!parseNode(state, nodeIndent, CONTEXT_FLOW_IN, false, true)) addEmptyScalarEvent(state);
-				skipFlowSeparationSpace(state, nodeIndent);
-				state.position++;
-				skipFlowSeparationSpace(state, nodeIndent);
+				insertFlowPairMappingEvent(state, entryStart);
+				if (!keyWasRead) addEmptyScalarEvent(state);
 			} else if (!keyWasRead) addEmptyScalarEvent(state);
 			if (!parseNode(state, nodeIndent, CONTEXT_FLOW_IN, false, true)) addEmptyScalarEvent(state);
 			skipFlowSeparationSpace(state, nodeIndent);
@@ -78381,9 +78852,8 @@ function readFlowCollection(state, nodeIndent, props) {
 			addEmptyScalarEvent(state);
 		} else if (isMapping) addEmptyScalarEvent(state);
 		else if (isPair) {
-			restoreState(state, entryStart);
-			addMappingEvent(state, entryStart.position, NO_RANGE$1, NO_RANGE$1, NO_RANGE$1, NO_RANGE$1, 2);
-			parseNode(state, nodeIndent, CONTEXT_FLOW_IN, false, true);
+			insertFlowPairMappingEvent(state, entryStart);
+			if (!keyWasRead) addEmptyScalarEvent(state);
 			addEmptyScalarEvent(state);
 			addPopEvent(state);
 		}
@@ -79038,7 +79508,7 @@ function isNsCharOrWhitespace(c) {
 function isPlainSafe(c, prev, inblock) {
 	const cIsNsCharOrWhitespace = isNsCharOrWhitespace(c);
 	const cIsNsChar = cIsNsCharOrWhitespace && !isWhitespace(c);
-	return (inblock ? cIsNsCharOrWhitespace : cIsNsCharOrWhitespace && c !== CHAR_COMMA && c !== CHAR_LEFT_SQUARE_BRACKET && c !== CHAR_RIGHT_SQUARE_BRACKET && c !== CHAR_LEFT_CURLY_BRACKET && c !== CHAR_RIGHT_CURLY_BRACKET) && c !== CHAR_SHARP && !(prev === CHAR_COLON && !cIsNsChar) || isNsCharOrWhitespace(prev) && !isWhitespace(prev) && c === CHAR_SHARP || prev === CHAR_COLON && cIsNsChar;
+	return (inblock ? cIsNsCharOrWhitespace : cIsNsCharOrWhitespace && c !== CHAR_COMMA && c !== CHAR_LEFT_SQUARE_BRACKET && c !== CHAR_RIGHT_SQUARE_BRACKET && c !== CHAR_LEFT_CURLY_BRACKET && c !== CHAR_RIGHT_CURLY_BRACKET) && c !== CHAR_SHARP && !(prev === CHAR_COLON && !cIsNsChar) || isNsCharOrWhitespace(prev) && !isWhitespace(prev) && c === CHAR_SHARP || prev === CHAR_COLON && cIsNsChar && (inblock || c !== CHAR_COMMA && c !== CHAR_LEFT_SQUARE_BRACKET && c !== CHAR_RIGHT_SQUARE_BRACKET && c !== CHAR_LEFT_CURLY_BRACKET && c !== CHAR_RIGHT_CURLY_BRACKET);
 }
 function isPlainSafeFirst(c) {
 	return isPrintable(c) && c !== CHAR_BOM && !isWhitespace(c) && c !== CHAR_MINUS && c !== CHAR_QUESTION && c !== CHAR_COLON && c !== CHAR_COMMA && c !== CHAR_LEFT_SQUARE_BRACKET && c !== CHAR_RIGHT_SQUARE_BRACKET && c !== CHAR_LEFT_CURLY_BRACKET && c !== CHAR_RIGHT_CURLY_BRACKET && c !== CHAR_SHARP && c !== CHAR_AMPERSAND && c !== CHAR_ASTERISK && c !== CHAR_EXCLAMATION && c !== CHAR_VERTICAL_LINE && c !== CHAR_EQUALS && c !== CHAR_GREATER_THAN && c !== CHAR_SINGLE_QUOTE && c !== CHAR_DOUBLE_QUOTE && c !== CHAR_PERCENT && c !== CHAR_COMMERCIAL_AT && c !== CHAR_GRAVE_ACCENT;
@@ -80190,6 +80660,7 @@ const enumerateParents = async (
       // eslint-disable-next-line unicorn/no-computed-property-existence-check
       !baseDirParents[dir] &&
       (dir = pathPosix.dirname(dir)) &&
+      // eslint-disable-next-line unicorn/prefer-simple-condition-first
       (dir !== lastDir)
     ) {
       lastDir = dir;
@@ -80354,7 +80825,7 @@ const createDirInfos = async (
     const overrides = dirInfo.markdownlintOptions?.overrides || [];
     for (const override of overrides) {
       const { filter, config, combine } = override;
-      if (filter && (filter.length > 0) && config && ((combine === "merge") || (combine === "replace"))) {
+      if (filter && config && (filter.length > 0) && ((combine === "merge") || (combine === "replace"))) {
         const filteredFiles = filterByGlobs(dirInfo.dir, dirInfo.files, filter);
         if (filteredFiles.length > 0) {
           dirInfo.files = dirInfo.files.filter((file) => !filteredFiles.includes(file));
@@ -80559,7 +81030,7 @@ const outputResults = async (
   /** @type {boolean} */ noImport
 ) => {
   // eslint-disable-next-line unicorn/prefer-early-return
-  if ((results.length > 0) || outputFormatters) {
+  if (outputFormatters || (results.length > 0)) {
     /** @type {OutputFormatterOptions} */
     const formatterOptions = {
       "directory": baseDir,
@@ -80679,8 +81150,8 @@ const markdownlint_cli2_main = async (/** @type {Parameters} */ params) => {
     }
   }
   if (
-    ((globPatterns.length === 0) && !useStdin && !nonFileContents) ||
-    (configPath === null)
+    (configPath === null) ||
+    (!useStdin && !nonFileContents && (globPatterns.length === 0))
   ) {
     return showHelp(logMessage, false);
   }
@@ -80993,9 +81464,9 @@ const parameters = {
     ]
   }
 };
-// eslint-disable-next-line unicorn/prefer-await
 markdownlint_cli2_main(parameters).then(
-  (code) => code && setFailed(`Failed with exit code: ${code}`),
+  (code) => code && setFailed(`Failed with exit code: ${code}`)
+).catch(
   (error) => setFailed(`Failed due to error: ${error}`)
 );
 
